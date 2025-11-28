@@ -80,7 +80,8 @@ class ContinuesBatchQueue(BaseQueue):
         new_waiting_bistream_list = []
         for req in self.waiting_req_bistream_list:
             if req.req_status.get_status() == ReqRunStatus.WAIT_FOR_TEXT:
-                req.try_to_fill_text()
+                with self.router.shm_req_manager.get_req_lock_by_index(req.index_in_shm_mem):
+                    req.try_to_fill_text()
             if req.req_status.get_status() == ReqRunStatus.WAIT_IN_QUEUE \
                 or req.req_status.get_status() == ReqRunStatus.WAIT_APPEND_PREFILL:
                 self.waiting_req_list.append(req)

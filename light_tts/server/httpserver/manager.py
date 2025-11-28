@@ -85,7 +85,8 @@ class HttpServerManager:
         else:
             text = request_dict.get("text", "")
             text_ids = self._encode(text)
-            req.append_bistream(text_ids, self.min_token_text_ratio, self.max_token_text_ratio)
+            with self.shm_req_manager.get_req_lock_by_index(req.index_in_shm_mem):
+                req.append_bistream(text_ids, self.min_token_text_ratio, self.max_token_text_ratio)
 
 
     async def transfer_to_next_module(
