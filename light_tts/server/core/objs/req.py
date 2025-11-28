@@ -315,7 +315,7 @@ class Req(ctypes.Structure):
         )
     
     def append_bistream(self, text_ids, min_token_text_ratio, max_token_text_ratio):
-        self.assign_slice(self.text_cache, self.text_len, text_ids)
+        self.assign_slice(self.text_cache, self.text_cache_start + self.text_len, text_ids)
         self.text_len += len(text_ids)
         self.sample_params.min_new_tokens += len(text_ids) * min_token_text_ratio
         self.sample_params.max_new_tokens += len(text_ids) * max_token_text_ratio

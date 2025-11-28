@@ -126,7 +126,8 @@ class TTS1EncodeManager:
                     if not req.bistream:
                         speech_token = (speech_token + self.vocab_size + 2)
                         audio_ids = speech_token.flatten().tolist()
-                        req.set_speech_token(audio_ids)
+                        with self.shm_req_manager.get_req_lock_by_index(req.index_in_shm_mem):
+                            req.set_speech_token(audio_ids)
 
                     req.prompt_token_pad = int(np.ceil(speech_token.size / self.token_hop_len) * self.token_hop_len - speech_token.size)
                     logger.info(f"Send:    {module_name:<14} | req_id {req.request_id} | semantic length {req.semantic_len} | text length {req.text_len} to tts_llm | with speech")
