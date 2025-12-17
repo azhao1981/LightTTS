@@ -1,7 +1,7 @@
 python -m light_tts.server.api_server \
   --httpserver_workers 3 \
   --encode_process_num 2 \
-  --decode_process_num 2 \
+  --decode_process_num 1 \
   --gpt_paral_num 100 \
   --load_trt True \
   --max_total_token_num 65536 \
