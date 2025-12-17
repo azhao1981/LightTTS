@@ -108,7 +108,7 @@ def normal_start(args):
     ports_locker = PortLocker([args.port])
     ports_locker.lock_port()
 
-    num_loras = max(args.decode_process_num, 1)  # 至少为1
+    num_loras = 1
     assert args.decode_process_num <= num_loras
 
     can_use_ports = alloc_can_use_network_port(
@@ -145,8 +145,7 @@ def normal_start(args):
     funcs = []
     start_args = []
     gpt_parall_lock = mp.Semaphore(args.gpt_paral_num)
-    style_names = ["CosyVoice2"] * num_loras
-    for style_name, tts_llm_port, tts_decode_port in zip(style_names, tts_llm_ports, tts_decode_ports): 
+    for style_name, tts_llm_port, tts_decode_port in zip(["CosyVoice2"], tts_llm_ports, tts_decode_ports): 
         funcs.append(start_tts_llm_process)
         start_args.append((args, tts_llm_port, tts_decode_port, style_name, gpt_parall_lock))
     process_manager.start_submodule_processes(start_funcs=funcs, start_args=start_args)
@@ -157,7 +156,7 @@ def normal_start(args):
     start_args = []
     for decode_proc_index in range(args.decode_process_num):
         tmp_args = []
-        for style_name, tts_decode_port in zip(style_names, tts_decode_ports):
+        for style_name, tts_decode_port in zip(["CosyVoice2"], tts_decode_ports):
             tmp_args.append((args, tts_decode_port, httpserver_port, style_name, decode_parall_lock, decode_proc_index))
         funcs.append(start_tts_decode_process)
         start_args.append((tmp_args,))
