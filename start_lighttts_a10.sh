@@ -162,86 +162,145 @@ start_single_worker() {
 
     log "启动单Worker模式 [Port: $port]..."
     log "日志文件: $log_file"
+    log "该模式约需60-90秒完成模型加载，请耐心等待..."
 
     export CUDA_VISIBLE_DEVICES=$GPU_ID
     export LIGHTLLM_DEBUG=0
 
-    echo "启动命令: python -m light_tts.server.api_server --model_dir $MODEL_DIR --port $port ..."
+    # 关键: 参数必须满足 batch_max_tokens >= max_req_total_len
+    # 经实测验证的A10稳定配置
+    local max_tokens=32768      # max_total_token_num
+    local max_req_len=16384     # max_req_total_len
+    local batch_tokens=16384    # batch_max_tokens
+    local cache_cap=100
 
-    # 前台启动并输出到日志
+    log "参数配置: max_tokens=$max_tokens, max_req_len=$max_req_len, batch_tokens=$batch_tokens"
+
     python -m light_tts.server.api_server \
         --model_dir "$MODEL_DIR" \
         --host "0.0.0.0" \
         --port "$port" \
         --encode_process_num 1 \
         --decode_process_num 1 \
-        --max_total_token_num 65536 \
-        --max_req_total_len 32768 \
-        --batch_max_tokens 16384 \
+        --max_total_token_num $max_tokens \
+        --max_req_total_len $max_req_len \
+        --batch_max_tokens $batch_tokens \
         --load_trt True \
-        --cache_capacity 200 \
+        --cache_capacity $cache_cap \
         --health_monitor > "$log_file" 2>&1 &
 
     local pid=$!
     echo $pid > "/tmp/lighttts_worker_single.pid"
+    log "进程已启动，PID: $pid"
 
-    # 等待并监控启动
-    sleep 5
-    tail -n 20 "$log_file"
+    # 等待模型加载 (首次启动需要~60秒)
+    log "等待模型加载..."
+    for i in {1..90}; do
+        if [ -f "/tmp/lighttts_single_${port}.log" ]; then
+            local line_count=$(wc -l < "/tmp/lighttts_single_${port}.log" 2>/dev/null || echo 0)
+            if [ $line_count -gt 50 ]; then
+                tail -n 5 "/tmp/lighttts_single_${port}.log"
+            fi
+        fi
+        # 双重检查: healthz 和 query_tts_model
+        if curl -s "http://localhost:$port/healthz" > /dev/null 2>&1 && \
+           curl -s "http://localhost:$port/query_tts_model" > /dev/null 2>&1; then
+            log "✓ 服务就绪! (耗时约 ${i}s)"
+            log "服务地址: http://localhost:$port"
+            return 0
+        fi
+        sleep 1
+    done
 
-    wait_for_health $port
-    log "单Worker模式运行中，PID: $pid"
+    log "⚠ 服务启动超时，请检查日志: tail -f $log_file"
+    exit 1
 }
 
 start_multi_workers() {
     local port1=$BASE_PORT
     local port2=$((BASE_PORT + 1))
 
-    log "启动双实例模式 (A10负载分摊)..."
+    log "启动双实例模式 (A10负载分摊)"
+    log "注意: 两个实例将共享GPU，每个约占用10GB显存"
     log "实例1: http://localhost:$port1"
-    log "实例2: http://localhost:$port2"
+    log "实例2: http://localhost:$port2 (60秒后启动)"
+
+    # 共享配置参数 (保守配置，确保稳定性)
+    local max_tokens=24576      # 每个实例分配少一点
+    local max_req_len=12288     # max_req_total_len = max_tokens / 2
+    local batch_tokens=12288    # batch_max_tokens >= max_req_len
+    local cache_cap=80
 
     # Worker 1
     export CUDA_VISIBLE_DEVICES=$GPU_ID
-    python -m light_tts.server.api_server \
+    nohup python -m light_tts.server.api_server \
         --model_dir "$MODEL_DIR" \
         --host "0.0.0.0" \
         --port "$port1" \
         --encode_process_num 1 \
         --decode_process_num 1 \
-        --max_total_token_num 40960 \
-        --max_req_total_len 20480 \
-        --batch_max_tokens 10240 \
+        --max_total_token_num $max_tokens \
+        --max_req_total_len $max_req_len \
+        --batch_max_tokens $batch_tokens \
         --load_trt True \
-        --cache_capacity 150 &
+        --cache_capacity $cache_cap \
+        --health_monitor > "/tmp/lighttts_worker_1.log" 2>&1 &
 
-    echo $! > "/tmp/lighttts_worker_1.pid"
-    log "Worker 1 启动中 (PID: $(cat /tmp/lighttts_worker_1.pid))"
-    sleep 20  # 让第一个实例先加载模型
+    local pid1=$!
+    echo $pid1 > "/tmp/lighttts_worker_1.pid"
+    log "Worker 1 启动中 (PID: $pid1, 日志: /tmp/lighttts_worker_1.log)"
 
-    # Worker 2 (复用同一GPU，降低token缓存)
+    # 等待第一个实例完成初始化 (约60-90秒)
+    log "等待Worker 1模型加载 (约60-90秒)..."
+    sleep 70
+
+    # Worker 2
     export CUDA_VISIBLE_DEVICES=$GPU_ID
-    python -m light_tts.server.api_server \
+    nohup python -m light_tts.server.api_server \
         --model_dir "$MODEL_DIR" \
         --host "0.0.0.0" \
         --port "$port2" \
         --encode_process_num 1 \
         --decode_process_num 1 \
-        --max_total_token_num 40960 \
-        --max_req_total_len 20480 \
-        --batch_max_tokens 10240 \
+        --max_total_token_num $max_tokens \
+        --max_req_total_len $max_req_len \
+        --batch_max_tokens $batch_tokens \
         --load_trt True \
-        --cache_capacity 150 &
+        --cache_capacity $cache_cap \
+        --health_monitor > "/tmp/lighttts_worker_2.log" 2>&1 &
 
-    echo $! > "/tmp/lighttts_worker_2.pid"
-    log "Worker 2 启动中 (PID: $(cat /tmp/lighttts_worker_2.pid))"
+    local pid2=$!
+    echo $pid2 > "/tmp/lighttts_worker_2.pid"
+    log "Worker 2 启动中 (PID: $pid2, 日志: /tmp/lighttts_worker_2.log)"
 
-    # 并行检查健康状态
-    wait_for_health $port1
-    wait_for_health $port2
+    # 检查两个实例 (双重健康检查)
+    log "等待两个实例就绪..."
+    for i in {1..90}; do
+        local ready=0
 
-    log "双实例模式部署完成"
-    log "负载均衡建议: nginx/haproxy 分发到 $port1 和 $port2"
+        # 双重检查: healthz + query_tts_model
+        if curl -s "http://localhost:$port1/healthz" > /dev/null 2>&1 && \
+           curl -s "http://localhost:$port1/query_tts_model" > /dev/null 2>&1; then
+            ready=$((ready+1))
+        fi
+
+        if curl -s "http://localhost:$port2/healthz" > /dev/null 2>&1 && \
+           curl -s "http://localhost:$port2/query_tts_model" > /dev/null 2>&1; then
+            ready=$((ready+1))
+        fi
+
+        if [ $ready -eq 2 ]; then
+            log "✓ 双实例模式完成! (耗时约 ${i}s)"
+            log "实例1: http://localhost:$port1"
+            log "实例2: http://localhost:$port2"
+            log "负载均衡建议: nginx/haproxy 分发到两个实例"
+            return 0
+        fi
+        [ $((i % 10)) -eq 0 ] && log "  已就绪实例: $ready/2 ..."
+        sleep 1
+    done
+
+    log "⚠ 部分实例启动超时，请检查日志"
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -279,8 +338,24 @@ main() {
 
     log "======================================================================"
     log "部署完成"
-    log "日志查看: tail -f /tmp/lighttts_*.log"
-    log "健康检查: curl http://localhost:$BASE_PORT/healthz"
+    log "======================================================================"
+    log "快速验证:"
+    log "  curl http://localhost:$BASE_PORT/healthz"
+    log ""
+    log "TTS测试 (需先准备 prompt.wav):"
+    log "  curl -X POST http://localhost:$BASE_PORT/inference_zero_shot \\"
+    log "    -F 'prompt_wav=@/path/to/prompt.wav' \\"
+    log "    -F 'prompt_text=我是测试用户' \\"
+    log "    -F 'tts_text=部署成功，LightTTS正在运行' \\"
+    log "    -F 'stream=false' > output.wav"
+    log ""
+    log "日志查看:"
+    log "  实时: tail -f /tmp/lighttts_*.log"
+    log "  进程: ps aux | grep api_server"
+    log "  GPU显存: nvidia-smi"
+    log ""
+    log "停止服务:"
+    log "  pkill -f 'python.*api_server' || cat /tmp/lighttts_worker_*.pid | xargs kill"
     log "======================================================================"
 }
 
