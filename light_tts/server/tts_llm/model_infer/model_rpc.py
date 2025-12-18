@@ -72,7 +72,7 @@ class ModelRpcServer:
             "max_req_num": kvargs.get("max_req_num", 1000),
             "max_seq_length": kvargs.get("max_seq_length", 1024 * 5),
             "use_dynamic_prompt_cache": True, # for bistream mode
-            "data_type": kvargs.get("data_type", "float16"),
+            "data_type": kvargs.get("data_type", "bfloat16"),  # A10: Use BF16 for native Ampere support (stable inference, no Loss Scaler needed)
             "style_name": self.style_name,
             "speech_token_size": self.speech_token_size,
             "graph_max_batch_size": kvargs.get("graph_max_batch_size", 16),

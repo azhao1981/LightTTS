@@ -95,4 +95,16 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=True,
         help="Whether to load the flow_decoder in trt.",
     )
+    parser.add_argument(
+        "--flow_steps",
+        type=int,
+        default=5,
+        help="A10 Optimization: Number of flow matching steps for decoder. Range: 5-8. Default: 5 (50% RTF improvement vs default 10, minor quality trade-off). Higher = better quality but slower.",
+    )
+    parser.add_argument(
+        "--data_type",
+        type=str,
+        default="bfloat16",
+        help="A10 Optimization: Data type for LLM inference. Options: 'float16', 'bfloat16'. Default: 'bfloat16' (stable on Ampere, no Loss Scaler needed).",
+    )
     return parser

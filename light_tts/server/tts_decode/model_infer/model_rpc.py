@@ -22,11 +22,14 @@ class TTS2DecodeModelRpcServer():
         torch.cuda.set_device(gpu_id)
         
         configs = load_yaml(model_dir)
+        # A10 Optimization: Pass flow_steps for RTF improvement (default 5, range 5-8)
+        flow_steps = kvargs.get("flow_steps", 5)
         self.model = CosyVoice2Model(
             configs['llm'],
             configs['flow'],
             configs['hift'],
-            fp16=True
+            fp16=True,
+            flow_steps=flow_steps
         )
         self.model.load('{}/llm.pt'.format(model_dir),
                         '{}/flow.pt'.format(model_dir),
