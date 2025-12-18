@@ -4,7 +4,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Attention
 
-- **不要在本项目中跑脚本或代码，这里没有环境**
 
 ## Common Development Commands
 
