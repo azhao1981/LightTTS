@@ -21,20 +21,20 @@ import json
 # Configuration - Modify these parameters as needed
 # ============================================================================
 CONFIG = {
-    "model_dir": "./pretrained_models/CosyVoice2-0.5B-finetune-v1",
+    "model_dir": "./pretrained_models/CosyVoice2-0.5B",
     "load_trt": True,
-    "max_total_token_num": 131072,
-    "max_req_total_len": 32768,
+    "max_total_token_num": 32768,  # A10 optimized: reduced for 24GB
+    "max_req_total_len": 8192,
     "host": "0.0.0.0",
     "port": 8080,
-    "httpserver_workers": 3,
+    "httpserver_workers": 2,  # A10 optimized: 2 workers for 24GB
     # Subprocess configuration
     "encode_process_num": 1,
-    "decode_process_num": 1,
-    "encode_paral_num": 50,
-    "gpt_paral_num": 50,
-    "decode_paral_num": 1,
-    "decode_max_batch_size": 1,
+    "decode_process_num": 2,  # A10 optimized: 2 decode processes
+    "encode_paral_num": 32,  # A10 optimized: reduced to prevent OOM
+    "gpt_paral_num": 32,
+    "decode_paral_num": 2,  # Allow 2 concurrent decodes
+    "decode_max_batch_size": 2,  # A10 optimized: batch size 2
     # Other defaults
     "zmq_mode": "ipc:///tmp/",
     "tokenizer_mode": "slow",
@@ -54,8 +54,10 @@ CONFIG = {
     "graph_max_batch_size": 16,
     "graph_max_len_in_batch": 32768,
     "load_jit": False,
-    "batch_max_tokens": None,
-    "mode": ["triton_flashdecoding"],
+    "batch_max_tokens": 4096,  # Control prefill batch size
+    "graph_max_batch_size": 4,  # CUDA Graph optimization
+    "mode": ["triton_flashdecoding"],  # Flash Attention for A10
+    "data_type": "bfloat16",  # A10 optimized precision
 }
 
 
@@ -126,6 +128,10 @@ def init_subprocesses():
 
     tts_llm_ports = can_use_ports[0:num_loras]
     del can_use_ports[0:num_loras]
+
+    # Set data_type for models if specified
+    if hasattr(args, 'data_type') and args.data_type:
+        os.environ["LIGHTTTS_DATA_TYPE"] = args.data_type
 
     # Set environment variables for Gunicorn workers
     set_env_start_args(args)

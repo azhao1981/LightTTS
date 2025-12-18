@@ -154,6 +154,7 @@ class RouterManager:
             "disable_cudagraph": self.args.disable_cudagraph,
             "graph_max_batch_size": self.args.graph_max_batch_size,
             "graph_max_len_in_batch": self.args.graph_max_len_in_batch,
+            "data_type": getattr(self.args, 'data_type', "float16"),  # Pass data_type to model
         }
         await self.model_rpc_client.init_model(kvargs=kvargs)
         if self.max_total_token_num is None:

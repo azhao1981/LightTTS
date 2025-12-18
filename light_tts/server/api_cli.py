@@ -95,4 +95,11 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=True,
         help="Whether to load the flow_decoder in trt.",
     )
+    parser.add_argument(
+        "--data_type",
+        type=str,
+        default="float16",
+        choices=["float16", "bfloat16", "float32"],
+        help="Model precision. bfloat16 recommended for A10 Ampere architecture.",
+    )
     return parser
