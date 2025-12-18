@@ -1,3 +1,4 @@
+.claude
 test/*.json
 test/*.md
 pretrained_models/
