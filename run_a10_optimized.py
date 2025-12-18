@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-A10 Optimized LightTTS Launcher
-Optimized for 24GB VRAM with balanced TTFA and throughput
-"""
+"""A10 Optimized LightTTS Launcher"""
 
 import os
 import sys
@@ -77,8 +74,20 @@ def main():
     ]
 
     # Import and run the server
-    from light_tts.server.api_server import main
-    main()
+    import torch
+    torch.multiprocessing.set_start_method("spawn", force=True)  # Required for subprocess
+
+    from light_tts.server.api_start import normal_start
+
+    # Create a simple args object
+    class Args:
+        def __init__(self):
+            for i in range(1, len(sys.argv), 2):
+                if i+1 < len(sys.argv):
+                    setattr(self, sys.argv[i].lstrip('-'), sys.argv[i+1])
+
+    args = Args()
+    normal_start(args)
 
 if __name__ == "__main__":
     main()
