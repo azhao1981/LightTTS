@@ -1,12 +1,37 @@
-# Light-TTS 本地多 Worker 部署指南
+# Light-TTS 本地多 Worker 部署指南 (修复版)
 
 ## 概述
 
-本文档详细介绍如何在单台服务器上部署 1个 LLM + 2-3个 Flow+HiFi-GAN Worker 的配置，以充分利用多 GPU 资源，实现最佳性能。
+本文档详细介绍如何在单台服务器上部署 1个 LLM + 2-3个 Flow+HiFi-GAN Worker 的配置。**注意：需要先修复 decode_process_num 限制问题**（参考 `decode-process-limit-analysis.md`）。
+
+## 🚨 部署前必读
+
+### 修复限制问题
+
+在部署多worker之前，必须先修复代码中的限制：
+
+1. **修改 api_start.py**：
+   ```python
+   # 注释或删除第111-112行的限制
+   # num_loras = 1
+   # assert args.decode_process_num <= num_loras
+
+   # 修改第142-143行的端口分配
+   # 原代码：
+   # tts_decode_ports = can_use_ports[0 : num_loras]
+   # 修改为：
+   tts_decode_ports = can_use_ports[0 : args.decode_process_num]
+   ```
+
+2. **验证修复**：
+   ```bash
+   # 应该可以成功启动多个workers
+   python -m light_tts.server.api_server --decode_process_num 3 --model_dir /path/to/model
+   ```
 
 ## 架构概览
 
-### 本地多进程架构
+### 本地多进程架构（修复后）
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -18,19 +43,29 @@
 ┌─────────────▼───────────────────────────────────────────┐
 │              HttpServerManager                          │
 │                   (进程间协调)                           │
-└─────┬───────────┬───────────────┬───────────────────────┘
-      │           │               │
-┌─────▼───┐ ┌─────▼─────┐ ┌──────▼─────┐
-│ Encode  │ │    LLM    │ │  Decode 1  │
-│Process 1│ │ Process 1 │ │ Process 1  │
-│         │ │ (GPU 0)   │ │ (GPU 1)    │
-└─────────┘ └───────────┘ └────────────┘
-                                │
-                        ┌───────▼───────┐
-                        │  Decode 2     │
-                        │ Process 2     │
-                        │ (GPU 2)        │
-                        └───────────────┘
+└─────┬───────────┬───────────────────┬─────────────────────┘
+      │           │                   │
+┌─────▼───┐ ┌─────▼─────┐   ┌───────▼───────┐ ┌──────────┐
+│ Encode  │ │    LLM    │   │  Decode 1     │ │ Decode 2 │
+│Process 1│ │ Process 1 │   │ Process 1     │ │ Process 2 │
+│         │ │ (GPU 0)   │   │ (GPU 1)       │ │ (GPU 2)   │
+└─────────┘ └───────────┘   └───────────────┘ └──────────┘
+```
+
+### 数据流设计
+
+```
+HTTP Request → HttpServer → Encode → LLM → (负载均衡) → Decode Workers
+                                          ↓
+                                    ┌─────────────┐
+                                    │ Decode 1    │ ← GPU 1
+                                    │ (Port 8084) │
+                                    └─────────────┘
+                                          ↓
+                                    ┌─────────────┐
+                                    │ Decode 2    │ ← GPU 2
+                                    │ (Port 8085) │
+                                    └─────────────┘
 ```
 
 ### 进程职责
