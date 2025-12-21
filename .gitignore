@@ -10,3 +10,5 @@ dist
 .vscode
 test/outs
 .claude
+.env
+.envrc
