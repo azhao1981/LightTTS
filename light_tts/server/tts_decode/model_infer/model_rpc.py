@@ -29,7 +29,7 @@ class TTS2DecodeModelRpcServer():
             configs['flow'],
             configs['hift'],
             fp16=True,
-            flow_steps=flow_steps
+            # flow_steps=flow_steps
         )
         self.model.load('{}/llm.pt'.format(model_dir),
                         '{}/flow.pt'.format(model_dir),

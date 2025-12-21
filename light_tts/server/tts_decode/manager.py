@@ -73,7 +73,7 @@ class TTSDecodeManager:
             "load_jit": self.args.load_jit,
             "load_trt": self.args.load_trt,
             # A10 Optimization: Flow steps for RTF improvement (default 5 on A10)
-            "flow_steps": getattr(self.args, 'flow_steps', 5),
+            # "flow_steps": getattr(self.args, 'flow_steps', 5),
         }
         await self.rpc_model.init_model(kvargs)
         return

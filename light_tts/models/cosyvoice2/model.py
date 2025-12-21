@@ -34,7 +34,7 @@ class CosyVoice2TpPartModel(Qwen2TpPartModel):
             self.data_type, network_config=self.config, mode=self.mode
         )
         self.trans_layers_weight = [
-            self.transformer_weight_class(i, torch.float16, network_config=self.config, mode=self.mode, quant_cfg=self.quant_cfg)
+            self.transformer_weight_class(i, self.data_type, network_config=self.config, mode=self.mode, quant_cfg=self.quant_cfg)
             for i in range(self.config["n_layer"])
         ]
         self.weight_dict = torch.load(self.pt_dir, map_location="cpu")

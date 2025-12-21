@@ -36,3 +36,17 @@ unzip resource.zip -d .
 uv pip install ttsfrd_dependency-0.1-py3-none-any.whl
 uv pip install ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl
 python -c "import ttsfrd; print('✅ ttsfrd installed successfully')"
+
+
+source .envrc && python -m light_tts.server.api_server \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --model_dir ./pretrained_models/CosyVoice2-0.5B-finetune-v1 \
+    --load_trt True \
+    --data_type bfloat16 \
+    --flow_steps 5 \
+    --max_total_token_num 65536 \
+    --max_req_total_len 32768
+
+# 这个需要安装
+uv pip install triton==3.1.0 --no-deps
