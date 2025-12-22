@@ -74,8 +74,8 @@ python -m light_tts.server.api_server \
 | `decode_process_num` | 2 | A10 可轻松处理 2 个 Decode workers |
 | `decode_max_batch_size` | 1 | 短文本不需要大批次，避免延迟增加 |
 | `decode_paral_num` | 3 | 提高并发处理能力 |
-| `gpt_paral_num` | 80 | 平衡吞吐和延迟 |
-| `gpt_paral_step_num` | 50 | 小步数，快速响应 |
+| `gpt_paral_num` | 80 | 全局并发上限，控制GPU总体负载 平衡吞吐和延迟 |
+| `gpt_paral_step_num` | 50 | 单进程连续执行次数，减少锁竞争 小步数，快速响应 |
 | `max_total_token_num` | 16384 | 减少内存占用，专注短文本 |
 | `max_req_total_len` | 2048 | 短文本长度限制 |
 | `batch_max_tokens` | 1024 | 小批次，快速处理 |
