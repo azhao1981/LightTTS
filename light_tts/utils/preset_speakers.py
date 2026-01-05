@@ -68,10 +68,16 @@ def warmup_presets(httpserver_manager, frontend=None):
                 if frontend is not None:
                     logger.info(f"[{speaker_id}] Step 5.1: Frontend is available, extracting features...")
                     try:
-                        logger.info(f"[{speaker_id}] Step 5.2: Converting numpy to torch tensor...")
-                        # 将 numpy 数组转换为 torch tensor
-                        prompt_speech_16k_tensor = torch.from_numpy(prompt_speech_16k)
-                        logger.info(f"[{speaker_id}] ✅ Tensor shape: {prompt_speech_16k_tensor.shape}, device: {prompt_speech_16k_tensor.device}")
+                        logger.info(f"[{speaker_id}] Step 5.2: Checking input type...")
+                        # load_wav() 已经返回 torch.Tensor，不需要转换
+                        if isinstance(prompt_speech_16k, torch.Tensor):
+                            prompt_speech_16k_tensor = prompt_speech_16k
+                            logger.info(f"[{speaker_id}] ✅ Input is already torch.Tensor, shape: {prompt_speech_16k_tensor.shape}, device: {prompt_speech_16k_tensor.device}")
+                        else:
+                            # 如果是 numpy 数组，才需要转换
+                            logger.info(f"[{speaker_id}] Input is numpy array, converting to torch.Tensor...")
+                            prompt_speech_16k_tensor = torch.from_numpy(prompt_speech_16k)
+                            logger.info(f"[{speaker_id}] ✅ Converted tensor shape: {prompt_speech_16k_tensor.shape}, device: {prompt_speech_16k_tensor.device}")
 
                         logger.info(f"[{speaker_id}] Step 5.3: Calling frontend.frontend_zero_shot...")
                         # 调用 frontend 提取特征
