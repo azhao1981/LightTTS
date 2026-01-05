@@ -115,12 +115,20 @@ class TTS1EncodeManager:
                         speech_feat = model_input["prompt_speech_feat"].squeeze(0).cpu().numpy()
                         embedding = model_input["llm_embedding"].cpu().numpy()
                         self.shared_speech_manager.set_index_speech(speech_index, speech_token, speech_feat, embedding)
+                        logger.info(f"tts_encode req_id {req.request_id} extracted speech features for index {speech_index}")
                     else:
-                        if not self.shared_speech_manager.speech_data_ready(speech_index):
+                        # 详细的诊断日志
+                        is_ready = self.shared_speech_manager.speech_data_ready(speech_index)
+                        use_mark = self.shared_speech_manager.use_marks.arr[speech_index]
+
+                        logger.info(f"tts_encode req_id {req.request_id} speech_index {speech_index} need_extract_speech=False, speech_data_ready={is_ready}, use_mark={use_mark}")
+
+                        if not is_ready:
+                            logger.warning(f"tts_encode req_id {req.request_id} speech_index {speech_index} data NOT ready (use_mark={use_mark}), re-queueing...")
                             self.waiting_reqs.append(req)
                             continue
                         else:
-                            logger.debug(f"tts_encode req_id {req.request_id} use speech index {speech_index} cache")
+                            logger.info(f"tts_encode req_id {req.request_id} using cached speech index {speech_index}")
                             speech_token = self.shared_speech_manager.get_index_speech_token(speech_index).arr[0]
 
                     if not req.bistream:

@@ -266,13 +266,19 @@ async def inference_zero_shot(
     sampling_params.verify()
 
     if speaker_id:
+        logger.info(f"Processing request with speaker_id: {speaker_id}")
+
         if speaker_id not in g_objs.preset_speakers:
+            available = list(g_objs.preset_speakers.keys())
+            logger.error(f"Unknown speaker: {speaker_id}. Available speakers: {available}")
             return create_error_response(HTTPStatus.BAD_REQUEST, f"Unknown speaker: {speaker_id}")
 
         preset = g_objs.preset_speakers[speaker_id]
+        logger.info(f"Found preset speaker config: index={preset['speech_index']}, md5={preset['speech_md5'][:8]}...")
 
         if prompt_text is None:
             prompt_text = preset['prompt_text']
+            logger.info(f"Using preset prompt_text (length: {len(prompt_text)})")
 
         prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
         tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
@@ -281,6 +287,14 @@ async def inference_zero_shot(
         speech_index = preset['speech_index']
         semantic_len = preset['semantic_len']
         have_alloc = True
+
+        # 检查共享内存状态
+        use_mark = g_objs.httpserver_manager.shared_speech_manager.use_marks.arr[speech_index]
+        is_ready = g_objs.httpserver_manager.shared_speech_manager.speech_data_ready(speech_index)
+        logger.info(f"speaker_id '{speaker_id}' speech_index={speech_index}, use_mark={use_mark}, speech_data_ready={is_ready}")
+
+        if not is_ready:
+            logger.warning(f"⚠️ speaker_id '{speaker_id}' speech data is NOT ready (use_mark={use_mark}, expected >= 3)")
     else:
         if not prompt_wav:
             return create_error_response(HTTPStatus.BAD_REQUEST, "Need speaker_id or prompt_wav")

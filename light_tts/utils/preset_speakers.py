@@ -19,18 +19,35 @@ PRESET_SPEAKERS = {
 def warmup_presets(httpserver_manager):
     warmed_presets = {}
 
+    logger.info("=" * 60)
+    logger.info("Starting preset speakers warmup...")
+    logger.info("=" * 60)
+
     for speaker_id, config in PRESET_SPEAKERS.items():
         audio_path = config['audio_path']
+        logger.info(f"[{speaker_id}] Loading preset speaker from: {audio_path}")
 
         if not Path(audio_path).exists():
+            logger.error(f"[{speaker_id}] Audio file not found: {audio_path}")
             logger.warning(f"Preset speaker '{speaker_id}' audio not found: {audio_path}")
             continue
 
         try:
+            logger.info(f"[{speaker_id}] Loading WAV file...")
             prompt_speech_16k = load_wav(audio_path, 16000)
+            logger.info(f"[{speaker_id}] WAV shape: {prompt_speech_16k.shape}")
+
             with open(audio_path, 'rb') as f:
                 speech_md5 = hashlib.md5(f.read()).hexdigest()
-            speech_index, _ = httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
+            logger.info(f"[{speaker_id}] MD5: {speech_md5}")
+
+            logger.info(f"[{speaker_id}] Allocating shared memory...")
+            speech_index, have_alloc = httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
+            logger.info(f"[{speaker_id}] Speech index: {speech_index}, have_alloc: {have_alloc}")
+
+            # 检查共享内存状态
+            use_mark = httpserver_manager.shared_speech_manager.use_marks.arr[speech_index]
+            logger.info(f"[{speaker_id}] Shared memory use_mark after alloc: {use_mark} (0=free, 1=allocated, 2=data_set, 3=ready)")
 
             warmed_presets[speaker_id] = {
                 "speech_md5": speech_md5,
@@ -38,8 +55,16 @@ def warmup_presets(httpserver_manager):
                 "semantic_len": (prompt_speech_16k.shape[1] + 239) // 640 + 10,
                 "prompt_text": config['prompt_text']
             }
-            logger.info(f"Preset speaker '{speaker_id}' loaded")
+            logger.info(f"[{speaker_id}] ✅ Preset speaker loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load preset speaker '{speaker_id}': {e}")
+            logger.error(f"[{speaker_id}] ❌ Failed to load preset speaker: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    logger.info("=" * 60)
+    logger.info(f"Preset speakers warmup completed. Loaded {len(warmed_presets)}/{len(PRESET_SPEAKERS)} speakers")
+    for speaker_id, info in warmed_presets.items():
+        logger.info(f"  - {speaker_id}: index={info['speech_index']}, md5={info['speech_md5'][:8]}...")
+    logger.info("=" * 60)
 
     return warmed_presets
