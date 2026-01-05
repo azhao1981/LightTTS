@@ -104,7 +104,8 @@ class G_Objs:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        self.preset_speakers = warmup_presets(self.httpserver_manager)
+        # Warmup preset speakers with frontend for complete feature extraction
+        self.preset_speakers = warmup_presets(self.httpserver_manager, frontend=self.frontend)
 
 g_objs = G_Objs()
 app = FastAPI()

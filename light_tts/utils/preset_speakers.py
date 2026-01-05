@@ -1,5 +1,6 @@
 import hashlib
 from pathlib import Path
+import torch
 from cosyvoice.utils.file_utils import load_wav
 from light_tts.utils.log_utils import init_logger
 
@@ -16,7 +17,7 @@ PRESET_SPEAKERS = {
     },
 }
 
-def warmup_presets(httpserver_manager):
+def warmup_presets(httpserver_manager, frontend=None):
     warmed_presets = {}
 
     logger.info("=" * 60)
@@ -48,6 +49,43 @@ def warmup_presets(httpserver_manager):
             # 检查共享内存状态
             use_mark = httpserver_manager.shared_speech_manager.use_marks.arr[speech_index]
             logger.info(f"[{speaker_id}] Shared memory use_mark after alloc: {use_mark} (0=free, 1=allocated, 2=data_set, 3=ready)")
+
+            # 如果是新分配的，需要提取语音特征
+            if not have_alloc:
+                logger.info(f"[{speaker_id}] Extracting speech features...")
+
+                # 如果提供了 frontend，使用它提取特征
+                if frontend is not None:
+                    logger.info(f"[{speaker_id}] Using provided frontend for feature extraction")
+
+                    # 将 numpy 数组转换为 torch tensor
+                    prompt_speech_16k_tensor = torch.from_numpy(prompt_speech_16k)
+
+                    # 调用 frontend 提取特征
+                    model_input = frontend.frontend_zero_shot(
+                        '', '', prompt_speech_16k_tensor, 16000, ''
+                    )
+
+                    speech_token = model_input["llm_prompt_speech_token"].cpu().numpy()
+                    speech_feat = model_input["prompt_speech_feat"].squeeze(0).cpu().numpy()
+                    embedding = model_input["llm_embedding"].cpu().numpy()
+
+                    # 设置完整的语音特征（这会将 use_mark 设置为 3）
+                    httpserver_manager.shared_speech_manager.set_index_speech(
+                        speech_index, speech_token, speech_feat, embedding
+                    )
+
+                    # 验证状态
+                    use_mark_after = httpserver_manager.shared_speech_manager.use_marks.arr[speech_index]
+                    logger.info(f"[{speaker_id}] ✅ Speech features extracted successfully, use_mark: {use_mark_after} (expected: 3)")
+
+                    if use_mark_after != 3:
+                        logger.error(f"[{speaker_id}] ❌ Unexpected use_mark after feature extraction: {use_mark_after}, expected 3")
+                else:
+                    logger.warning(f"[{speaker_id}] ⚠️ No frontend provided, speech features will be extracted on first request")
+                    logger.warning(f"[{speaker_id}] This may cause issues if multiple requests use the same preset speaker simultaneously")
+            else:
+                logger.info(f"[{speaker_id}] Using cached speech data (have_alloc=True)")
 
             warmed_presets[speaker_id] = {
                 "speech_md5": speech_md5,

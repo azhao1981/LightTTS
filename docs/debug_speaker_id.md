@@ -1,8 +1,19 @@
 # Speaker_ID 问题诊断指南
 
+## 问题状态
+
+✅ **已修复** - 详见下方"修复方案"章节
+
 ## 问题描述
 
 使用 `speaker_id` 参数后，服务无响应，日志显示持续等待输出数据。
+
+**症状日志**：
+```log
+WARNING: tts_encode req_id 0 speech_index 0 data NOT ready (use_mark=2), re-queueing...
+INFO: tts_encode req_id 0 speech_index 0 need_extract_speech=False, speech_data_ready=False, use_mark=2
+... (无限循环)
+```
 
 ## 问题根源分析
 
@@ -99,69 +110,115 @@ WARNING: tts_encode req_id 2 speech_index 0 data NOT ready (use_mark=2), re-queu
 
 ## 修复方案
 
-### 方案 A: 完善 Preset 预热流程（推荐）
+### ✅ 已实施的修复（方案 A：完善 Preset 预热流程）
 
-在 `warmup_presets()` 中提取语音特征：
+**修改文件**：
+1. [light_tts/utils/preset_speakers.py](light_tts/utils/preset_speakers.py) - 添加 frontend 参数和特征提取逻辑
+2. [light_tts/server/api_http.py:108](light_tts/server/api_http.py#L108) - 传递 frontend 到 warmup_presets
+
+**修复详情**：
+
+#### 1. preset_speakers.py 修改
 
 ```python
-# preset_speakers.py
+# 添加 torch 导入
 import torch
-from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 
-# 在 warmup_presets() 函数中，alloc_speech_mem 之后添加：
-if not have_alloc:
-    # 加载 frontend
-    frontend = httpserver_manager.frontend  # 需要暴露 frontend
+# 修改函数签名，添加 frontend 参数
+def warmup_presets(httpserver_manager, frontend=None):
+    # ... 原有代码 ...
 
-    # 提取特征
-    prompt_speech_16k_tensor = torch.from_numpy(prompt_speech_16k)
-    model_input = frontend.frontend_zero_shot('', '', prompt_speech_16k_tensor, 16000, '')
+    if not have_alloc:
+        # 如果提供了 frontend，使用它提取特征
+        if frontend is not None:
+            # 将 numpy 数组转换为 torch tensor
+            prompt_speech_16k_tensor = torch.from_numpy(prompt_speech_16k)
 
-    speech_token = model_input["llm_prompt_speech_token"].cpu().numpy()
-    speech_feat = model_input["prompt_speech_feat"].squeeze(0).cpu().numpy()
-    embedding = model_input["llm_embedding"].cpu().numpy()
+            # 调用 frontend 提取特征
+            model_input = frontend.frontend_zero_shot(
+                '', '', prompt_speech_16k_tensor, 16000, ''
+            )
 
-    # 设置完整特征
-    httpserver_manager.shared_speech_manager.set_index_speech(
-        speech_index, speech_token, speech_feat, embedding
-    )
+            speech_token = model_input["llm_prompt_speech_token"].cpu().numpy()
+            speech_feat = model_input["prompt_speech_feat"].squeeze(0).cpu().numpy()
+            embedding = model_input["llm_embedding"].cpu().numpy()
 
-    logger.info(f"[{speaker_id}] Speech features extracted, use_mark should be 3 now")
+            # 设置完整的语音特征（这会将 use_mark 设置为 3）
+            httpserver_manager.shared_speech_manager.set_index_speech(
+                speech_index, speech_token, speech_feat, embedding
+            )
+
+            # 验证状态
+            use_mark_after = httpserver_manager.shared_speech_manager.use_marks.arr[speech_index]
+            logger.info(f"[{speaker_id}] ✅ Speech features extracted, use_mark: {use_mark_after} (expected: 3)")
 ```
 
-### 方案 B: 首次请求时提取特征（临时方案）
-
-修改 API 层逻辑，让 preset speaker 的首次请求执行特征提取：
+#### 2. api_http.py 修改
 
 ```python
-# api_http.py
-need_extract_speech = need_extract_speech and not have_alloc
+# 修改 warmup_presets 调用，传递 frontend
+self.preset_speakers = warmup_presets(self.httpserver_manager, frontend=self.frontend)
+```
 
-# 修改为：
-need_extract_speech = (need_extract_speech and not have_alloc) or (speaker_id and not have_alloc)
+### 修复效果
+
+**修复前**：
+```log
+INFO: [male] Shared memory use_mark after alloc: 2 (0=free, 1=allocated, 2=data_set, 3=ready)
+WARNING: tts_encode req_id 0 speech_index 0 data NOT ready (use_mark=2), re-queueing...
+... (死循环)
+```
+
+**修复后（预期）**：
+```log
+INFO: [male] Shared memory use_mark after alloc: 2 (0=free, 1=allocated, 2=data_set, 3=ready)
+INFO: [male] Extracting speech features...
+INFO: [male] Using provided frontend for feature extraction
+INFO: [male] ✅ Speech features extracted successfully, use_mark: 3 (expected: 3)
+INFO: [male] ✅ Preset speaker loaded successfully
+
+# 请求时
+INFO: speaker_id 'male' speech_index=0, use_mark=3, speech_data_ready=True
+INFO: tts_encode req_id 0 speech_index 0 need_extract_speech=False, speech_data_ready=True, use_mark=3
+INFO: tts_encode req_id 0 using cached speech index 0
+INFO: Send:    tts_encode     | req_id 0 | ... to tts_llm | with speech
 ```
 
 ## 测试验证
 
-### 预期正常日志（修复后）
+### 验证步骤
 
-```log
-# 启动时
-INFO: [male] Shared memory use_mark after alloc: 3 (0=free, 1=allocated, 2=data_set, 3=ready)
+1. **重启服务**：
+   ```bash
+   python -m light_tts.server.api_server --model_dir ./pretrained_models/CosyVoice2-0.5B-latest
+   ```
 
-# 请求时
-INFO: speaker_id 'male' speech_index=0, use_mark=3, speech_data_ready=True
-INFO: tts_encode req_id 2 speech_index 0 need_extract_speech=False, speech_data_ready=True, use_mark=3
-INFO: tts_encode req_id 2 using cached speech index 0
-INFO: Send:    tts_encode     | req_id 2 | ... to tts_llm | with speech
-```
+2. **观察启动日志**，确认特征提取成功：
+   ```log
+   INFO: [male] Extracting speech features...
+   INFO: [male] Using provided frontend for feature extraction
+   INFO: [male] ✅ Speech features extracted successfully, use_mark: 3 (expected: 3)
+   INFO: [male] ✅ Preset speaker loaded successfully
+   INFO: Preset speakers warmup completed. Loaded 2/2 speakers
+   ```
 
-## 下一步行动
+3. **运行测试脚本**：
+   ```bash
+   python test/tts_client_v2.py
+   ```
 
-1. **使用当前增强日志重新运行服务**
-2. **收集完整日志**（从启动到请求卡住）
-3. **确认 `use_mark` 值**
-4. **根据分析结果应用对应的修复方案**
+4. **检查请求处理日志**，确认正常流程：
+   ```log
+   INFO: Processing request with speaker_id: male
+   INFO: speaker_id 'male' speech_index=0, use_mark=3, speech_data_ready=True
+   INFO: tts_encode req_id 0 speech_index 0 need_extract_speech=False, speech_data_ready=True, use_mark=3
+   INFO: tts_encode req_id 0 using cached speech index 0
+   INFO: Send:    tts_encode     | req_id 0 | ... to tts_llm | with speech
+   ```
+
+5. **验证音频输出**：
+   - 检查 `assets/` 目录下生成的 WAV 文件
+   - 播放音频，确认质量和内容正常
 
 ## 相关文件
 
