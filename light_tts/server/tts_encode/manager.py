@@ -129,7 +129,7 @@ class TTS1EncodeManager:
                             continue
                         else:
                             logger.info(f"tts_encode req_id {req.request_id} using cached speech index {speech_index}")
-                            speech_token = self.shared_speech_manager.get_index_speech_token(speech_index).arr[0]
+                            speech_token = self.shared_speech_manager.get_index_speech_token(speech_index).arr
 
                     if not req.bistream:
                         speech_token = (speech_token + self.vocab_size + 2)

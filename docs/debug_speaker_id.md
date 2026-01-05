@@ -6,6 +6,8 @@
 
 ## 问题描述
 
+### Bug #1: 无限循环问题（已修复）
+
 使用 `speaker_id` 参数后，服务无响应，日志显示持续等待输出数据。
 
 **症状日志**：
@@ -14,6 +16,14 @@ WARNING: tts_encode req_id 0 speech_index 0 data NOT ready (use_mark=2), re-queu
 INFO: tts_encode req_id 0 speech_index 0 need_extract_speech=False, speech_data_ready=False, use_mark=2
 ... (无限循环)
 ```
+
+### Bug #2: 音频错乱问题（已修复）🔥
+
+使用 `speaker_id` 后服务有响应，但生成的音频完全错乱。
+
+**症状**：
+- 能返回音频，但音频内容完全错误
+- 对比上传同一个音频文件，音色质量完全不同
 
 ## 问题根源分析
 
@@ -25,9 +35,9 @@ INFO: tts_encode req_id 0 speech_index 0 need_extract_speech=False, speech_data_
 - `2`: 原始音频数据已设置 (set_index_data)
 - `3`: 语音特征已提取完成 (set_index_speech) ✅ **Ready**
 
-### 问题所在
+### Bug #1 根源：Preset Speaker 预热流程不完整
 
-**Preset Speaker 预热流程不完整**：
+**问题所在**：
 - `warmup_presets()` 只调用 `alloc_speech_mem()` → `set_index_data()` → 设置 `use_mark=2`
 - **缺少 `set_index_speech()` 调用** → 未设置 `use_mark=3`
 
@@ -35,6 +45,23 @@ INFO: tts_encode req_id 0 speech_index 0 need_extract_speech=False, speech_data_
 - `speech_data_ready()` 检查 `use_mark >= 3`
 - 当 `use_mark=2` 时，检查失败
 - 请求被重新排队，形成死循环
+
+### Bug #2 根源：缓存数据访问错误 🔥
+
+**错误代码**（[encode/manager.py:132](light_tts/server/tts_encode/manager.py#L132)）：
+```python
+speech_token = self.shared_speech_manager.get_index_speech_token(speech_index).arr[0]
+```
+
+**问题分析**：
+1. `get_index_speech_token()` 返回 `SharedArray` 对象
+2. 其 `.arr` 属性是完整的 numpy 数组，shape 为 `(1, seq_len)`
+3. 加上 `[0]` 后只取第一个元素（标量），导致后续处理完全错误
+4. 对比第114行的正确用法：`speech_token = model_input["llm_prompt_speech_token"].cpu().numpy()`
+
+**影响范围**：
+- 只影响使用 `speaker_id` 的请求（走缓存路径）
+- 上传音频文件的请求不受影响（走特征提取路径）
 
 ## 增强日志说明
 
@@ -110,15 +137,15 @@ WARNING: tts_encode req_id 2 speech_index 0 data NOT ready (use_mark=2), re-queu
 
 ## 修复方案
 
-### ✅ 已实施的修复（方案 A：完善 Preset 预热流程）
+### ✅ Bug #1 修复：完善 Preset 预热流程
 
 **修改文件**：
 1. [light_tts/utils/preset_speakers.py](light_tts/utils/preset_speakers.py) - 添加 frontend 参数和特征提取逻辑
-2. [light_tts/server/api_http.py:108](light_tts/server/api_http.py#L108) - 传递 frontend 到 warmup_presets
+2. [light_tts/server/api_http.py:104](light_tts/server/api_http.py#L104) - 传递 frontend 到 warmup_presets
 
 **修复详情**：
 
-#### 1. preset_speakers.py 修改
+#### preset_speakers.py 修改
 
 ```python
 # 添加 torch 导入
@@ -131,8 +158,11 @@ def warmup_presets(httpserver_manager, frontend=None):
     if not have_alloc:
         # 如果提供了 frontend，使用它提取特征
         if frontend is not None:
-            # 将 numpy 数组转换为 torch tensor
-            prompt_speech_16k_tensor = torch.from_numpy(prompt_speech_16k)
+            # load_wav() 已经返回 torch.Tensor，不需要转换
+            if isinstance(prompt_speech_16k, torch.Tensor):
+                prompt_speech_16k_tensor = prompt_speech_16k
+            else:
+                prompt_speech_16k_tensor = torch.from_numpy(prompt_speech_16k)
 
             # 调用 frontend 提取特征
             model_input = frontend.frontend_zero_shot(
@@ -153,12 +183,36 @@ def warmup_presets(httpserver_manager, frontend=None):
             logger.info(f"[{speaker_id}] ✅ Speech features extracted, use_mark: {use_mark_after} (expected: 3)")
 ```
 
-#### 2. api_http.py 修改
+#### api_http.py 修改
 
 ```python
 # 修改 warmup_presets 调用，传递 frontend
 self.preset_speakers = warmup_presets(self.httpserver_manager, frontend=self.frontend)
 ```
+
+### ✅ Bug #2 修复：正确访问缓存数据 🔥
+
+**修改文件**：
+1. [light_tts/server/tts_encode/manager.py:132](light_tts/server/tts_encode/manager.py#L132)
+
+**修复详情**：
+
+#### 错误代码：
+```python
+# 第132行（错误）
+speech_token = self.shared_speech_manager.get_index_speech_token(speech_index).arr[0]
+```
+
+#### 正确代码：
+```python
+# 第132行（正确）
+speech_token = self.shared_speech_manager.get_index_speech_token(speech_index).arr
+```
+
+**说明**：
+- `get_index_speech_token()` 返回 `SharedArray` 对象
+- 其 `.arr` 属性是完整的 numpy 数组，shape 为 `(1, seq_len)`
+- 不应该加 `[0]`，应该直接使用 `.arr` 获取完整数组
 
 ### 修复效果
 
