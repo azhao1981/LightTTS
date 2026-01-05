@@ -60,6 +60,7 @@ from light_tts.utils.start_utils import process_manager
 from .metrics import histogram_timer
 from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from light_tts.utils.process_check import is_process_active
+from light_tts.utils.preset_speakers import warmup_presets
 from prometheus_client import Counter, Histogram, generate_latest
 all_request_counter = Counter("lightllm_request_count", "The total number of requests")
 failure_request_counter = Counter("lightllm_request_failure", "The total number of requests")
@@ -102,6 +103,8 @@ class G_Objs:
         del self.frontend.speech_tokenizer_session
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        self.preset_speakers = warmup_presets(self.httpserver_manager)
 
 g_objs = G_Objs()
 app = FastAPI()
@@ -159,6 +162,7 @@ async def send_wav(websocket: WebSocket, generator):
 
 @app.websocket("/inference_zero_shot_bistream")
 async def inference_zero_shot_bistream(websocket: WebSocket):
+    # TODO: 支持 speaker_id 参数调用预置说话人
     global lora_styles
     # 接受 WebSocket 连接
     await websocket.accept()
@@ -240,8 +244,9 @@ async def inference_zero_shot_bistream(websocket: WebSocket):
 async def inference_zero_shot(
         request: Request,
         tts_text: str = Form(),
-        prompt_text: str = Form(),
-        prompt_wav: UploadFile = File(),
+        prompt_text: str = Form(None),
+        speaker_id: str = Form(None),
+        prompt_wav: UploadFile = File(None),
         stream: bool = Form(default=False),
         tts_model_name: str = Form(default="default"),
         speed: float = Form(default=1.0),
@@ -254,23 +259,46 @@ async def inference_zero_shot(
 
     if tts_model_name == "default":
         tts_model_name = lora_styles[0]
-    
-    # 检查请求参数
+
     sample_params_dict = {}
     sampling_params = SamplingParams()
     sampling_params.init(**sample_params_dict)
     sampling_params.verify()
-    prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
-    tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
-    prompt_speech_16k = load_wav(prompt_wav.file, 16000)
-    semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
-    
-    prompt_wav.file.seek(0)
-    speech_md5 = calculate_md5(prompt_wav.file)
+
+    if speaker_id:
+        if speaker_id not in g_objs.preset_speakers:
+            return create_error_response(HTTPStatus.BAD_REQUEST, f"Unknown speaker: {speaker_id}")
+
+        preset = g_objs.preset_speakers[speaker_id]
+
+        if prompt_text is None:
+            prompt_text = preset['prompt_text']
+
+        prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
+        tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
+
+        speech_md5 = preset['speech_md5']
+        speech_index = preset['speech_index']
+        semantic_len = preset['semantic_len']
+        have_alloc = True
+    else:
+        if not prompt_wav:
+            return create_error_response(HTTPStatus.BAD_REQUEST, "Need speaker_id or prompt_wav")
+
+        if not prompt_text:
+            return create_error_response(HTTPStatus.BAD_REQUEST, "prompt_text required when using prompt_wav")
+
+        prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
+        tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
+        prompt_speech_16k = load_wav(prompt_wav.file, 16000)
+        semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10
+
+        prompt_wav.file.seek(0)
+        speech_md5 = calculate_md5(prompt_wav.file)
+        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
 
     generate_objs = []
-    need_extract_speech=True
-    speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
+    need_extract_speech = True
 
     request_ids = []
     for text in tts_texts:
