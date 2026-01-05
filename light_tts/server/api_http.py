@@ -98,14 +98,17 @@ class G_Objs:
                                           '{}/speech_tokenizer_v2.onnx'.format(args.model_dir),
                                           '{}/spk2info.pt'.format(args.model_dir),
                                           configs['allowed_special'])
+
+        # Warmup preset speakers with frontend for complete feature extraction
+        # MUST be done before deleting frontend components!
+        self.preset_speakers = warmup_presets(self.httpserver_manager, frontend=self.frontend)
+
+        # Free up memory by deleting large frontend components after warmup
         del self.frontend.feat_extractor
         del self.frontend.campplus_session
         del self.frontend.speech_tokenizer_session
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        # Warmup preset speakers with frontend for complete feature extraction
-        self.preset_speakers = warmup_presets(self.httpserver_manager, frontend=self.frontend)
 
 g_objs = G_Objs()
 app = FastAPI()
