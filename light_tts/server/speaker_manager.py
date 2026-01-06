@@ -15,6 +15,9 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 import yaml
+import torch
+from cosyvoice.utils.file_utils import load_wav
+
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +112,10 @@ class SpeakerManager:
                 return False
 
             # 加载音频文件
-            from cosyvoice.utils.file_utils import load_wav
             prompt_speech_16k = load_wav(audio_path, 16000)
 
             # 直接调用 CosyVoiceFrontEnd 的 frontend_zero_shot 方法提取特征
             # 然后将结果存入 spk2info 字典 (等效于 model.add_zero_shot_spk)
-            import torch
             model_input = self.model.frontend_zero_shot('', prompt_text, prompt_speech_16k, 24000, '')
             del model_input['text']
             del model_input['text_len']

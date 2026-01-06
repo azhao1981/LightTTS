@@ -100,9 +100,10 @@ class G_Objs:
                                           '{}/speech_tokenizer_v2.onnx'.format(args.model_dir),
                                           '{}/spk2info.pt'.format(args.model_dir),
                                           configs['allowed_special'])
-        del self.frontend.feat_extractor
-        del self.frontend.campplus_session
-        del self.frontend.speech_tokenizer_session
+        # TODO: 这是lighttts 原来要删除的，先尝试不删除
+        # del self.frontend.feat_extractor
+        # del self.frontend.campplus_session
+        # del self.frontend.speech_tokenizer_session
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
