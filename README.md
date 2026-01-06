@@ -1,4 +1,4 @@
-![Light TTS Banner](asset/light-tts.jpg)
+![Light TTS Banner](assets/light-tts.jpg)
 
 # light-tts
 
