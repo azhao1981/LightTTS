@@ -72,16 +72,29 @@ class SharedTensorManager:
 
 
 class SharedSpeechManager:
-    def __init__(self, name, size, init_mark=True) -> None:
+    def __init__(self, name, size, init_mark=True, preset_slots=10) -> None:
+        """
+        初始化共享内存管理器
+
+        Args:
+            name: 共享内存名称前缀
+            size: 总槽位数
+            init_mark: 是否初始化标记
+            preset_slots: 预设音色固定槽位数 (默认 10)
+                         预设音色使用 [0, preset_slots), 动态上传使用 [preset_slots, size)
+        """
         self.name = name
         self.size = size
+        self.preset_slots = preset_slots
+        self.dynamic_slots = size - preset_slots
+
         self.use_marks = SharedArray(f"{name}_use_marks", (size,), dtype=np.int32)
         if init_mark:
             self.use_marks.arr[:] = 0
         self.lru_cache = OrderedDict()
         self.lock = threading.Lock()
 
-        # 新增: spk_id 到 speech_index 的映射 (用于预设音色快速路径)
+        # 预设音色映射: spk_id → 固定槽位 [0, preset_slots)
         self.spk_id_to_index = {}
 
         self.prompt_speech_16k_manager = SharedTensorManager(f"{name}_prompt_speech_16k", size)
@@ -92,22 +105,38 @@ class SharedSpeechManager:
         
     
     def alloc(self, speech_md5):
+        """
+        动态上传模式分配共享内存 (仅使用 [preset_slots, size) 槽位)
+
+        Args:
+            speech_md5: 音频 MD5 哈希
+
+        Returns:
+            (index, have_alloc): index=共享内存索引, have_alloc=是否已缓存
+        """
         with self.lock:
+            # 检查缓存
             if speech_md5 in self.lru_cache:
                 self.lru_cache.move_to_end(speech_md5)
                 return self.lru_cache[speech_md5], True
+
+            # 新分配: 只在动态槽位范围 [preset_slots, size) 内查找
             index = None
-            if len(self.lru_cache) >= self.size:
+            if len(self.lru_cache) >= self.dynamic_slots:
+                # 动态槽位 LRU 已满,驱逐最久未使用的项
                 key, value = self.lru_cache.popitem(last=False)
                 index = value
+                # 重置状态为已分配 (后续 set_index_data 会更新为 2)
+                self.use_marks.arr[index] = 1
             else:
-                for i in range(self.size):
+                # 在动态槽位范围 [preset_slots, size) 内查找空闲槽位
+                for i in range(self.preset_slots, self.size):
                     if self.use_marks.arr[i] == 0:
                         index = i
                         break
 
             if index is None:
-                raise RuntimeError("alloc error")
+                raise RuntimeError(f"alloc failed: no available slot in dynamic range [{self.preset_slots}, {self.size})")
 
             self.use_marks.arr[index] = 1
             self.lru_cache[speech_md5] = index
@@ -116,6 +145,8 @@ class SharedSpeechManager:
     def alloc_by_spk_id(self, spk_id):
         """
         通过 spk_id 分配共享内存 (预设音色快速路径)
+
+        使用固定槽位 [0, preset_slots), 不参与 LRU 驱逐
 
         Args:
             spk_id: 音色 ID
@@ -127,39 +158,32 @@ class SharedSpeechManager:
             # 检查 spk_id 是否已映射
             if spk_id in self.spk_id_to_index:
                 index = self.spk_id_to_index[spk_id]
-                # 更新 LRU (使用 spk_id 作为 key)
-                if spk_id in self.lru_cache:
-                    self.lru_cache.move_to_end(spk_id)
-                else:
-                    # 如果 spk_id 不在 lru_cache 中,添加它
-                    # 注意: 这可能发生在预加载时 spk_id 已映射但未在 lru_cache 中的情况
-                    self.lru_cache[spk_id] = index
                 return index, True  # 命中缓存
 
-            # 未映射,分配新索引
+            # 未映射,在预设槽位范围 [0, preset_slots) 内分配新索引
+            # 注意: 不检查 LRU,预设音色不参与驱逐
+            if len(self.spk_id_to_index) >= self.preset_slots:
+                raise RuntimeError(
+                    f"alloc_by_spk_id failed: preset slots full ({self.preset_slots}), "
+                    f"cannot register spk_id='{spk_id}'. "
+                    f"Consider increasing --preset-slots parameter."
+                )
+
+            # 在预设槽位范围 [0, preset_slots) 内查找空闲槽位
             index = None
-            if len(self.lru_cache) >= self.size:
-                # 缓存已满,驱逐最久未使用的项
-                key, value = self.lru_cache.popitem(last=False)
-                # 如果驱逐的是 spk_id,从 spk_id_to_index 中移除
-                if key in self.spk_id_to_index:
-                    del self.spk_id_to_index[key]
-                index = value
-            else:
-                # 找到空闲槽位
-                for i in range(self.size):
-                    if self.use_marks.arr[i] == 0:
-                        index = i
-                        break
+            for i in range(self.preset_slots):
+                if self.use_marks.arr[i] == 0:
+                    index = i
+                    break
 
             if index is None:
-                raise RuntimeError(f"alloc_by_spk_id failed: no available slot for spk_id={spk_id}")
+                # 理论上不应该到达这里 (前面已经检查了数量)
+                raise RuntimeError(f"alloc_by_spk_id failed: no available slot in preset range [0, {self.preset_slots})")
 
             # 标记为已分配
             self.use_marks.arr[index] = 1
-            # 建立双重映射: spk_id → index 和 index → spk_id (通过 lru_cache)
+            # 建立映射 (不加入 LRU,预设音色固定槽位)
             self.spk_id_to_index[spk_id] = index
-            self.lru_cache[spk_id] = index
 
             return index, False  # 新分配
 

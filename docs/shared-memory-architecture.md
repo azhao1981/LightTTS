@@ -29,15 +29,21 @@ LightTTS 使用跨进程共享内存（Shared Memory）实现高效的音频特�
 
 ```python
 SharedSpeechManager:
+├── preset_slots: int = 10           # 预设音色固定槽位数
+├── dynamic_slots: int = 90          # 动态上传槽位数 (size - preset_slots)
 ├── use_marks: Array[int]           # 使用标记 (0=空闲, 1=已分配, 2=有原始音频, 3=有特征)
-├── lru_cache: OrderedDict          # MD5/spk_id → speech_index 映射
-├── spk_id_to_index: Dict           # spk_id → speech_index 映射 (预设音色快速路径)
+├── lru_cache: OrderedDict          # MD5 → speech_index 映射 (仅动态上传)
+├── spk_id_to_index: Dict           # spk_id → speech_index 映射 (仅预设音色)
 ├── lock: ThreadLock                # 并发保护
 │
 ├── prompt_speech_16k_manager       # 原始音频 (16kHz float32)
 ├── speech_token_manager             # 语音 token (int32)
 ├── speech_feat_manager              # 语音特征 (float32)
 └── spk_embedding_manager            # 说话人嵌入 (float32)
+
+# 槽位分配策略:
+# [0, preset_slots)        → 预设音色 (固定槽位, 不参与 LRU)
+# [preset_slots, size)     → 动态上传 (LRU 缓存)
 ```
 
 ### 状态机
@@ -332,34 +338,60 @@ alloc_speech_mem(spk_id="male") → 直接映射
 
 ### 关键实现
 
-#### 1. SharedSpeechManager 新增映射
+#### 1. SharedSpeechManager 固定槽位设计
 
-**文件**: [shm_speech_manager.py](../light_tts/server/core/objs/shm_speech_manager.py:85,116-164)
+**文件**: [shm_speech_manager.py](../light_tts/server/core/objs/shm_speech_manager.py:75-188)
+
+**核心改进**: 使用固定槽位隔离预设音色和动态上传
 
 ```python
 class SharedSpeechManager:
-    def __init__(self, name, size, init_mark=True):
-        # 新增: spk_id 到 speech_index 的映射
-        self.spk_id_to_index = {}
+    def __init__(self, name, size, init_mark=True, preset_slots=10):
+        self.preset_slots = preset_slots           # 预设音色槽位数 (默认 10)
+        self.dynamic_slots = size - preset_slots   # 动态上传槽位数
+        self.spk_id_to_index = {}                  # spk_id → 固定槽位映射
 
     def alloc_by_spk_id(self, spk_id: str) -> Tuple[int, bool]:
-        """通过 spk_id 直接分配共享内存 (无需 MD5)"""
+        """预设音色: 使用固定槽位 [0, preset_slots), 不参与 LRU"""
         with self.lock:
             if spk_id in self.spk_id_to_index:
-                index = self.spk_id_to_index[spk_id]
-                self.lru_cache.move_to_end(spk_id)
-                return index, True  # 命中缓存
+                return self.spk_id_to_index[spk_id], True  # 命中缓存
 
-            # 新分配
-            index = self._find_free_slot()
+            # 在预设槽位范围内分配
+            if len(self.spk_id_to_index) >= self.preset_slots:
+                raise RuntimeError(f"preset slots full ({self.preset_slots})")
+
+            index = self._find_free_slot_in_range(0, self.preset_slots)
             self.spk_id_to_index[spk_id] = index
-            self.lru_cache[spk_id] = index
+            return index, False  # 新分配
+
+    def alloc(self, speech_md5: str) -> Tuple[int, bool]:
+        """动态上传: 使用 LRU 槽位 [preset_slots, size)"""
+        with self.lock:
+            if speech_md5 in self.lru_cache:
+                return self.lru_cache[speech_md5], True
+
+            # 在动态槽位范围内分配 (支持 LRU 驱逐)
+            index = self._find_or_evict_in_range(self.preset_slots, self.size)
+            self.lru_cache[speech_md5] = index
             return index, False
+```
+
+**槽位分配示意图**:
+```
+索引:  0   1   2   ...   9  |  10  11  12  ...  99
+       ├──┬──┬──┬──┬──┤   ├─┬──┬──┬──┬──┤
+       │  │  │  │  │  │   │  │  │  │  │
+       └──┴──┴──┴──┴──┘   └──┴──┴──┴──┴──┘
+       预设音色 (固定)      动态上传 (LRU)
+       [0, 10)             [10, 100)
 ```
 
 #### 2. SpeakerManager 预加载共享内存
 
-**文件**: [speaker_manager.py](../light_tts/server/speaker_manager.py:128-153)
+**文件**: [speaker_manager.py](../light_tts/server/speaker_manager.py:128-165)
+
+**优化**: 预计算 `semantic_len` 并存储
 
 ```python
 class SpeakerManager:
@@ -370,8 +402,11 @@ class SpeakerManager:
         # 提取特征
         model_input = self.model.frontend_zero_shot(...)
 
-        # 预分配共享内存
+        # 预分配共享内存 (固定槽位)
         speech_index, have_alloc = self.shared_speech_manager.alloc_by_spk_id(spk_id)
+
+        # 预计算语义长度
+        semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10
 
         if not have_alloc:
             # 存储原始音频
@@ -383,11 +418,19 @@ class SpeakerManager:
             self.shared_speech_manager.set_index_speech(
                 speech_index, speech_token, speech_feat, embedding
             )
+
+        # 存储完整信息 (包括 semantic_len)
+        self.voices[spk_id] = {
+            'audio_path': audio_path,
+            'prompt_text': prompt_text,
+            'speech_index': speech_index,
+            'semantic_len': semantic_len,  # 预计算值
+        }
 ```
 
 #### 3. HTTP API 快速路径
 
-**文件**: [api_http.py](../light_tts/server/api_http.py:282-299)
+**文件**: [api_http.py](../light_tts/server/api_http.py:287-302)
 
 ```python
 @app.post("/inference_zero_shot")
@@ -399,10 +442,12 @@ async def inference_zero_shot(spk_id: str = Form(default=""), ...):
         # 无需 MD5 计算,无需加载音频文件
         voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
         prompt_text = voice_info['prompt_text']
+        semantic_len = voice_info.get('semantic_len', 0)  # 使用预计算值
         need_extract_speech = False  # 特征已在启动时提取
     else:
         # ========== 动态上传路径 ==========
         prompt_speech_16k = load_wav(prompt_wav.file, 16000)
+        semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10
         speech_md5 = calculate_md5(prompt_wav.file)
         speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(
             speech_md5=speech_md5, prompt_wav=prompt_speech_16k
@@ -418,6 +463,7 @@ async def inference_zero_shot(spk_id: str = Form(default=""), ...):
 | **音频加载** | 每次请求 | 启动时一次 | ✅ 减少 I/O |
 | **特征提取** | 每次请求 | 启动时一次 | ✅ 减少 CPU |
 | **内存查找** | MD5 Hash Map | spk_id Dict | ✅ 更快 |
+| **LRU 驱逐风险** | 可能被驱逐 | **固定槽位,永不驱逐** | ✅ 100% |
 
 ### 启动时预加载流程
 
@@ -431,10 +477,11 @@ SpeakerManager.load_presets()
 对每个音色:
   1. 加载音频文件 (启动时一次)
   2. 提取特征 (启动时一次)
-  3. alloc_by_spk_id(spk_id) → 分配 speech_index
+  3. alloc_by_spk_id(spk_id) → 分配固定槽位 [0, preset_slots)
   4. 存储原始音频 + 特征到共享内存
+  5. 预计算 semantic_len 并存储到 voices 字典
   ↓
-预设音色就绪,等待请求
+预设音色就绪,固定槽位,永不驱逐
 ```
 
 ### 请求处理流程
@@ -444,11 +491,32 @@ POST /inference_zero_shot?spk_id=male&tts_text=你好
   ↓
 alloc_speech_mem(spk_id="male")
   ↓
-查询 spk_id_to_index["male"] → speech_index=5
+查询 spk_id_to_index["male"] → speech_index=2 (固定槽位)
   ↓
-Encode 模块从 speech_index=5 读取已缓存的特征
+Encode 模块从 speech_index=2 读取已缓存的特征
   ↓
 LLM/Decode 模块生成音频
+```
+
+### 固定槽位优势
+
+1. **零驱逐风险**: 预设音色使用固定槽位,永远不会被 LRU 驱逐
+2. **性能可预测**: 预设音色响应时间恒定,不受缓存状态影响
+3. **资源隔离**: 预设音色和动态上传完全隔离,互不影响
+4. **易于监控**: 可精确统计预设音色和动态上传的资源使用
+
+### 配置建议
+
+| 场景 | preset_slots | cache_capacity | 说明 |
+|------|-------------|----------------|------|
+| **小规模** | 5 | 50 | 5 个预设音色,45 个动态上传 |
+| **中规模** | 10 | 100 | 10 个预设音色,90 个动态上传 |
+| **大规模** | 20 | 200 | 20 个预设音色,180 个动态上传 |
+
+**计算公式**:
+```
+cache_capacity = preset_slots + 动态上传槽位数
+dynamic_slots = cache_capacity - preset_slots
 ```
 
 ---

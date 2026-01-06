@@ -127,9 +127,13 @@ class SpeakerManager:
 
             # 如果有共享内存管理器,预分配共享内存并存储特征
             speech_index = None
+            semantic_len = 0  # 默认值
             if self.shared_speech_manager is not None:
                 # 使用 spk_id 直接分配共享内存 (无需 MD5)
                 speech_index, have_alloc = self.shared_speech_manager.alloc_by_spk_id(spk_id)
+
+                # 预计算语义长度 (与动态上传模式保持一致)
+                semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10
 
                 if not have_alloc:
                     # 第一次分配,存储原始音频数据到共享内存
@@ -148,14 +152,15 @@ class SpeakerManager:
                         speech_index, speech_token, speech_feat, embedding
                     )
 
-                    logger.info(f"✓ 加载并预分配共享内存: [{spk_id}] → speech_index={speech_index}")
+                    logger.info(f"✓ 加载并预分配共享内存: [{spk_id}] → speech_index={speech_index}, semantic_len={semantic_len}")
                 else:
-                    logger.info(f"✓ 加载 (已缓存): [{spk_id}] → speech_index={speech_index}")
+                    logger.info(f"✓ 加载 (已缓存): [{spk_id}] → speech_index={speech_index}, semantic_len={semantic_len}")
 
             self.voices[spk_id] = {
                 'audio_path': audio_path,
                 'prompt_text': prompt_text,
                 'speech_index': speech_index,  # 存储共享内存索引
+                'semantic_len': semantic_len,  # 存储预计算的语义长度
             }
             return True
 

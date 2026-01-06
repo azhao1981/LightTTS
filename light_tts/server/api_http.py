@@ -293,10 +293,8 @@ async def inference_zero_shot(
         prompt_text = voice_info['prompt_text']
         prompt_speech_16k = None  # 预设音色已在共享内存中,无需再次加载
 
-        # 计算语义长度 (从 SpeakerManager 中获取或重新计算)
-        # 这里我们假设语义长度已预先计算并存储在 voices 字典中
-        # 如果没有,可以设置为 0 或从音频文件计算
-        semantic_len = 0  # 或从 voice_info 中获取预计算的值
+        # 使用预计算的语义长度 (与动态上传模式保持一致的计算方式)
+        semantic_len = voice_info.get('semantic_len', 0)
 
         speech_md5 = None
         # 注意: 预设音色已在 SpeakerManager.load_presets() 时提取特征并存储到共享内存
