@@ -69,6 +69,7 @@ from dataclasses import dataclass
 from .health_monitor import start_health_check_process
 from light_tts.utils.log_utils import init_logger
 from light_tts.server import TokenLoad
+from light_tts.server.speaker_manager import SpeakerManager
 
 
 logger = init_logger(__name__)
@@ -81,6 +82,8 @@ class G_Objs:
     args: object = None
     httpserver_manager: HttpServerManager = None
     shared_token_load: TokenLoad = None
+    frontend: CosyVoiceFrontEnd = None
+    speaker_manager: SpeakerManager = None
 
     def set_args(self, args):
         self.args = args
@@ -102,6 +105,16 @@ class G_Objs:
         del self.frontend.speech_tokenizer_session
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # 初始化 SpeakerManager,加载预设音色
+        voices_yaml_path = os.path.join(os.path.dirname(__file__), '../../voices.yaml')
+        if not os.path.exists(voices_yaml_path):
+            # 尝试项目根目录
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            voices_yaml_path = os.path.join(project_root, 'voices.yaml')
+
+        self.speaker_manager = SpeakerManager(model=self.frontend, yaml_path=voices_yaml_path)
+        self.speaker_manager.load_presets()
 
 g_objs = G_Objs()
 app = FastAPI()
@@ -240,8 +253,9 @@ async def inference_zero_shot_bistream(websocket: WebSocket):
 async def inference_zero_shot(
         request: Request,
         tts_text: str = Form(),
-        prompt_text: str = Form(),
-        prompt_wav: UploadFile = File(),
+        spk_id: str = Form(default=""),
+        prompt_text: str = Form(default=""),
+        prompt_wav: UploadFile = File(default=None),
         stream: bool = Form(default=False),
         tts_model_name: str = Form(default="default"),
         speed: float = Form(default=1.0),
@@ -254,32 +268,64 @@ async def inference_zero_shot(
 
     if tts_model_name == "default":
         tts_model_name = lora_styles[0]
-    
-    # 检查请求参数
-    sample_params_dict = {}
-    sampling_params = SamplingParams()
-    sampling_params.init(**sample_params_dict)
-    sampling_params.verify()
-    prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
+
+    # 检查 spk_id 参数
+    if spk_id:
+        if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(spk_id):
+            available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+            return create_error_response(
+                HTTPStatus.BAD_REQUEST,
+                f"Invalid spk_id '{spk_id}'. Available presets: {available}"
+            )
+        # 使用预设音色,不需要 prompt_wav 和 prompt_text
+        prompt_text = ""
+        prompt_speech_16k = None
+        semantic_len = 0
+        speech_md5 = None
+        speech_index = None
+        need_extract_speech = False
+    else:
+        # 原有逻辑:动态上传音色
+        if not prompt_wav or not prompt_text:
+            return create_error_response(
+                HTTPStatus.BAD_REQUEST,
+                "Please provide either spk_id (preset voice) or both prompt_wav and prompt_text (custom voice)"
+            )
+
+        sample_params_dict = {}
+        sampling_params = SamplingParams()
+        sampling_params.init(**sample_params_dict)
+        sampling_params.verify()
+        prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
+        tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
+        prompt_speech_16k = load_wav(prompt_wav.file, 16000)
+        semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
+
+        prompt_wav.file.seek(0)
+        speech_md5 = calculate_md5(prompt_wav.file)
+        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
+        need_extract_speech = True and not have_alloc
+
     tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
-    prompt_speech_16k = load_wav(prompt_wav.file, 16000)
-    semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
-    
-    prompt_wav.file.seek(0)
-    speech_md5 = calculate_md5(prompt_wav.file)
+
+    # 初始化 SamplingParams (需要在两种模式下都初始化)
+    if spk_id:
+        sample_params_dict = {}
+        sampling_params = SamplingParams()
+        sampling_params.init(**sample_params_dict)
+        sampling_params.verify()
 
     generate_objs = []
-    need_extract_speech=True
-    speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
 
     request_ids = []
     for text in tts_texts:
         cur_req_dict = {
             "text": text,
+            "spk_id": spk_id,  # 新增字段
             "prompt_text": prompt_text,
             "tts_model_name": tts_model_name,
             "speech_md5": speech_md5,
-            "need_extract_speech": need_extract_speech and not have_alloc,
+            "need_extract_speech": need_extract_speech,
             "stream": stream,
             "speech_index": speech_index,
             "semantic_len": semantic_len,
@@ -316,6 +362,26 @@ async def inference_zero_shot(
 async def show_available_styles(request: Request) -> Response:
     data = {"tts_models": lora_styles}
     json_data = json.dumps(data)
+    return Response(content=json_data, media_type="application/json")
+
+@app.post("/query_presets")
+@app.get("/query_presets")
+async def query_preset_voices(request: Request) -> Response:
+    """查询可用的预设音色"""
+    if not g_objs.speaker_manager:
+        data = {
+            "presets": [],
+            "message": "SpeakerManager not initialized"
+        }
+    else:
+        stats = g_objs.speaker_manager.get_statistics()
+        data = {
+            "presets": stats['available_spk_ids'],
+            "loaded_count": stats['loaded'],
+            "failed_count": stats['failed'],
+            "total_count": stats['total']
+        }
+    json_data = json.dumps(data, ensure_ascii=False)
     return Response(content=json_data, media_type="application/json")
 
 @app.get("/metrics")
