@@ -67,6 +67,7 @@ def test_preset_inference(text, spk_id, output_file, base_url="http://localhost:
         return False
 
 
+# python test/test_presets.py   --text "测试音色质量"   --spk_id male_long   --output test_male_long.wav   --url http://140.143.248.104:8090 --stream
 def main():
     parser = argparse.ArgumentParser(description="测试预设音色功能")
     parser.add_argument("--text", type=str, default="你好,这是一个测试。", help="要合成的文本")

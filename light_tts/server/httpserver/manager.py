@@ -66,11 +66,36 @@ class HttpServerManager:
         self.max_token_text_ratio = 20
         return
 
-    def alloc_speech_mem(self, speech_md5, prompt_wav):
-        index, have_alloc = self.shared_speech_manager.alloc(speech_md5)
-        if not have_alloc:
-            self.shared_speech_manager.set_index_data(index, prompt_wav.shape, prompt_wav)
-        return index, have_alloc
+    def alloc_speech_mem(self, speech_md5=None, prompt_wav=None, spk_id=None):
+        """
+        分配共享内存用于存储音频特征
+
+        Args:
+            speech_md5: 音频 MD5 哈希 (动态上传模式)
+            prompt_wav: 音频数据 (numpy array)
+            spk_id: 音色 ID (预设音色模式)
+
+        Returns:
+            (index, have_alloc): index=共享内存索引, have_alloc=是否已缓存
+
+        注意:
+            - 如果 spk_id 不为 None,使用预设音色快速路径 (无需 MD5)
+            - 如果 spk_id 为 None,使用动态上传模式 (需要 MD5 和 prompt_wav)
+        """
+        if spk_id is not None:
+            # 预设音色模式: 直接使用 spk_id 分配
+            index, have_alloc = self.shared_speech_manager.alloc_by_spk_id(spk_id)
+            # 注意: 预设音色的原始音频和特征已在 SpeakerManager.load_presets() 时存入
+            return index, have_alloc
+        else:
+            # 动态上传模式: 使用 MD5 哈希
+            if speech_md5 is None or prompt_wav is None:
+                raise ValueError("动态上传模式需要 speech_md5 和 prompt_wav")
+
+            index, have_alloc = self.shared_speech_manager.alloc(speech_md5)
+            if not have_alloc:
+                self.shared_speech_manager.set_index_data(index, prompt_wav.shape, prompt_wav)
+            return index, have_alloc
     
     async def append_bistream(self, request_dict, request_id):
         # 等待 request_id 出现在 dict 中（generate 可能还没执行完初始化）

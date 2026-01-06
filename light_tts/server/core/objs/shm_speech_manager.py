@@ -81,6 +81,9 @@ class SharedSpeechManager:
         self.lru_cache = OrderedDict()
         self.lock = threading.Lock()
 
+        # 新增: spk_id 到 speech_index 的映射 (用于预设音色快速路径)
+        self.spk_id_to_index = {}
+
         self.prompt_speech_16k_manager = SharedTensorManager(f"{name}_prompt_speech_16k", size)
         self.speech_feat_manager = SharedTensorManager(f"{name}_speech_feat", size)
         self.speech_token_manager = SharedTensorManager(f"{name}_speech_token", size)
@@ -102,14 +105,64 @@ class SharedSpeechManager:
                     if self.use_marks.arr[i] == 0:
                         index = i
                         break
-            
+
             if index is None:
                 raise RuntimeError("alloc error")
 
             self.use_marks.arr[index] = 1
             self.lru_cache[speech_md5] = index
             return index, False
-    
+
+    def alloc_by_spk_id(self, spk_id):
+        """
+        通过 spk_id 分配共享内存 (预设音色快速路径)
+
+        Args:
+            spk_id: 音色 ID
+
+        Returns:
+            (index, have_alloc): index=共享内存索引, have_alloc=是否已缓存
+        """
+        with self.lock:
+            # 检查 spk_id 是否已映射
+            if spk_id in self.spk_id_to_index:
+                index = self.spk_id_to_index[spk_id]
+                # 更新 LRU (使用 spk_id 作为 key)
+                if spk_id in self.lru_cache:
+                    self.lru_cache.move_to_end(spk_id)
+                else:
+                    # 如果 spk_id 不在 lru_cache 中,添加它
+                    # 注意: 这可能发生在预加载时 spk_id 已映射但未在 lru_cache 中的情况
+                    self.lru_cache[spk_id] = index
+                return index, True  # 命中缓存
+
+            # 未映射,分配新索引
+            index = None
+            if len(self.lru_cache) >= self.size:
+                # 缓存已满,驱逐最久未使用的项
+                key, value = self.lru_cache.popitem(last=False)
+                # 如果驱逐的是 spk_id,从 spk_id_to_index 中移除
+                if key in self.spk_id_to_index:
+                    del self.spk_id_to_index[key]
+                index = value
+            else:
+                # 找到空闲槽位
+                for i in range(self.size):
+                    if self.use_marks.arr[i] == 0:
+                        index = i
+                        break
+
+            if index is None:
+                raise RuntimeError(f"alloc_by_spk_id failed: no available slot for spk_id={spk_id}")
+
+            # 标记为已分配
+            self.use_marks.arr[index] = 1
+            # 建立双重映射: spk_id → index 和 index → spk_id (通过 lru_cache)
+            self.spk_id_to_index[spk_id] = index
+            self.lru_cache[spk_id] = index
+
+            return index, False  # 新分配
+
     def set_index_data(self, index, shape, data):
         self.prompt_speech_16k_manager.set_index_data(index, shape, data, np.float32)
         self.use_marks.arr[index] = 2

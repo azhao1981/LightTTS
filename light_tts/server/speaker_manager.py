@@ -25,17 +25,19 @@ logger = logging.getLogger(__name__)
 class SpeakerManager:
     """音色管理器"""
 
-    def __init__(self, model, yaml_path: str = None):
+    def __init__(self, model, yaml_path: str = None, shared_speech_manager=None):
         """
         初始化音色管理器
 
         Args:
             model: CosyVoice2 模型实例
             yaml_path: voices.yaml 配置文件路径
+            shared_speech_manager: 共享内存管理器 (用于预设音色预分配)
         """
         self.model = model
         self.yaml_path = yaml_path
-        self.voices: Dict[str, dict] = {}  # {spk_id: {audio_path, prompt_text}}
+        self.shared_speech_manager = shared_speech_manager
+        self.voices: Dict[str, dict] = {}  # {spk_id: {audio_path, prompt_text, speech_index}}
         self.loaded_count = 0
         self.failed_count = 0
 
@@ -91,7 +93,7 @@ class SpeakerManager:
 
     def _register_voice(self, spk_id: str, audio_path: str, prompt_text: str) -> bool:
         """
-        注册单个音色到模型
+        注册单个音色到模型和共享内存
 
         Args:
             spk_id: 音色 ID
@@ -123,11 +125,38 @@ class SpeakerManager:
             # 存入 spk2info 字典
             self.model.spk2info[spk_id] = model_input
 
+            # 如果有共享内存管理器,预分配共享内存并存储特征
+            speech_index = None
+            if self.shared_speech_manager is not None:
+                # 使用 spk_id 直接分配共享内存 (无需 MD5)
+                speech_index, have_alloc = self.shared_speech_manager.alloc_by_spk_id(spk_id)
+
+                if not have_alloc:
+                    # 第一次分配,存储原始音频数据到共享内存
+                    self.shared_speech_manager.set_index_data(
+                        speech_index,
+                        prompt_speech_16k.shape,
+                        prompt_speech_16k.cpu().numpy()
+                    )
+
+                    # 提取并存储特征到共享内存 (供 Encode 模块复用)
+                    speech_token = model_input["llm_prompt_speech_token"].cpu().numpy()
+                    speech_feat = model_input["prompt_speech_feat"].squeeze(0).cpu().numpy()
+                    embedding = model_input["llm_embedding"].cpu().numpy()
+
+                    self.shared_speech_manager.set_index_speech(
+                        speech_index, speech_token, speech_feat, embedding
+                    )
+
+                    logger.info(f"✓ 加载并预分配共享内存: [{spk_id}] → speech_index={speech_index}")
+                else:
+                    logger.info(f"✓ 加载 (已缓存): [{spk_id}] → speech_index={speech_index}")
+
             self.voices[spk_id] = {
                 'audio_path': audio_path,
                 'prompt_text': prompt_text,
+                'speech_index': speech_index,  # 存储共享内存索引
             }
-            logger.info(f"✓ 加载成功: [{spk_id}] - {audio_path}")
             return True
 
         except Exception as e:

@@ -114,7 +114,12 @@ class G_Objs:
             project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             voices_yaml_path = os.path.join(project_root, 'voices.yaml')
 
-        self.speaker_manager = SpeakerManager(model=self.frontend, yaml_path=voices_yaml_path)
+        # 传入 shared_speech_manager 以支持预设音色预分配共享内存
+        self.speaker_manager = SpeakerManager(
+            model=self.frontend,
+            yaml_path=voices_yaml_path,
+            shared_speech_manager=self.httpserver_manager.shared_speech_manager
+        )
         self.speaker_manager.load_presets()
 
 g_objs = G_Objs()
@@ -278,15 +283,27 @@ async def inference_zero_shot(
                 HTTPStatus.BAD_REQUEST,
                 f"Invalid spk_id '{spk_id}'. Available presets: {available}"
             )
-        # 使用预设音色,不需要 prompt_wav 和 prompt_text
-        prompt_text = ""
-        prompt_speech_16k = None
-        semantic_len = 0
+
+        # ========== 预设音色快速路径 (优化后) ==========
+        # 直接使用 spk_id 分配共享内存,无需 MD5 计算
+        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
+
+        # 获取预设音色的详细信息
+        voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
+        prompt_text = voice_info['prompt_text']
+        prompt_speech_16k = None  # 预设音色已在共享内存中,无需再次加载
+
+        # 计算语义长度 (从 SpeakerManager 中获取或重新计算)
+        # 这里我们假设语义长度已预先计算并存储在 voices 字典中
+        # 如果没有,可以设置为 0 或从音频文件计算
+        semantic_len = 0  # 或从 voice_info 中获取预计算的值
+
         speech_md5 = None
-        speech_index = None
+        # 注意: 预设音色已在 SpeakerManager.load_presets() 时提取特征并存储到共享内存
+        # 因此 need_extract_speech 应该总是 False (因为 have_alloc 应该总是 True)
         need_extract_speech = False
     else:
-        # 原有逻辑:动态上传音色
+        # ========== 动态上传音色 (原有逻辑) ==========
         if not prompt_wav or not prompt_text:
             return create_error_response(
                 HTTPStatus.BAD_REQUEST,
@@ -298,13 +315,13 @@ async def inference_zero_shot(
         sampling_params.init(**sample_params_dict)
         sampling_params.verify()
         prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
-        tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
+
         prompt_speech_16k = load_wav(prompt_wav.file, 16000)
         semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
 
         prompt_wav.file.seek(0)
         speech_md5 = calculate_md5(prompt_wav.file)
-        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
+        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5=speech_md5, prompt_wav=prompt_speech_16k)
         need_extract_speech = True and not have_alloc
 
     tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
