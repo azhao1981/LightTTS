@@ -150,85 +150,6 @@ def liveness():
 def readiness():
     return {"status": "ok"}
 
-
-from pynvml import (
-    nvmlInit,
-    nvmlDeviceGetHandleByIndex,
-    nvmlDeviceGetMemoryInfo,
-    nvmlDeviceGetUtilizationRates,
-)
-import threading
-# =========================
-# GPU / TTS 调度状态（单卡单进程）
-# =========================
-
-# 对当前进程而言，GPU index 永远是 0（CUDA_VISIBLE_DEVICES 已隔离）
-nvmlInit()
-def get_nvml_handle_from_cuda_visible_devices():
-    """
-    返回当前进程实际使用的物理 GPU 的 NVML handle
-    """
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-
-    if not visible:
-        # 没设置，默认用物理 0（不推荐生产这样跑）
-        return nvmlDeviceGetHandleByIndex(0)
-
-    # CUDA_VISIBLE_DEVICES 可能是 "1" / "0,2" / "3,4"
-    physical_ids = [int(x) for x in visible.split(",") if x.strip() != ""]
-
-    # 单卡单进程：只取第一个
-    physical_gpu_id = physical_ids[0]
-
-    return nvmlDeviceGetHandleByIndex(physical_gpu_id)
-_nvml_handle = get_nvml_handle_from_cuda_visible_devices()
-_MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", "6"))
-
-_inflight = 0
-_inflight_lock = threading.Lock()
-
-def inflight_inc():
-    global _inflight
-    with _inflight_lock:
-        _inflight += 1
-
-def inflight_dec():
-    global _inflight
-    with _inflight_lock:
-        _inflight -= 1
-        if _inflight < 0:
-            _inflight = 0
-
-def inflight_get():
-    with _inflight_lock:
-        return _inflight
-@app.get("/healthz_gpu")
-async def healthz_gpu():
-    """
-    ⚠️ 仅用于调度器（Dispatcher）
-    返回 GPU 驱动级状态 + TTS inflight
-    """
-
-    mem = nvmlDeviceGetMemoryInfo(_nvml_handle)
-    util = nvmlDeviceGetUtilizationRates(_nvml_handle)
-
-    total_mb = mem.total // (1024 * 1024)
-    used_mb = mem.used // (1024 * 1024)
-    free_mb = mem.free // (1024 * 1024)
-
-    return {
-        "gpu_id": 0,
-        "gpu": {
-            "total_mb": total_mb,
-            "used_mb": used_mb,
-            "free_mb": free_mb,
-            "util_percent": util.gpu,
-        },
-        "tts": {
-            "inflight": inflight_get(),
-            "max_inflight": _MAX_INFLIGHT,
-        }
-    }
 def generate_data(model_output):
     for i in model_output:
         tts_audio = (i['tts_speech'] * (2 ** 15)).astype(np.int16).tobytes()
@@ -345,117 +266,112 @@ async def inference_zero_shot(
         tts_model_name: str = Form(default="default"),
         speed: float = Form(default=1.0),
     ):
-    try:
-        inflight_inc()
-        all_request_counter.inc()
-        global lora_styles
+    all_request_counter.inc()
+    global lora_styles
 
-        if stream and speed != 1.0:
-            return create_error_response(HTTPStatus.BAD_REQUEST, "speed change only support non-stream inference mode")
+    if stream and speed != 1.0:
+        return create_error_response(HTTPStatus.BAD_REQUEST, "speed change only support non-stream inference mode")
 
-        if tts_model_name == "default":
-            tts_model_name = lora_styles[0]
+    if tts_model_name == "default":
+        tts_model_name = lora_styles[0]
 
-        # 检查 spk_id 参数
-        if spk_id:
-            if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(spk_id):
-                available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
-                return create_error_response(
-                    HTTPStatus.BAD_REQUEST,
-                    f"Invalid spk_id '{spk_id}'. Available presets: {available}"
-                )
-
-            # ========== 预设音色快速路径 (优化后) ==========
-            # 直接使用 spk_id 分配共享内存,无需 MD5 计算
-            speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
-
-            # 获取预设音色的详细信息
-            voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
-            prompt_text = voice_info['prompt_text']
-            prompt_speech_16k = None  # 预设音色已在共享内存中,无需再次加载
-
-            # 使用预计算的语义长度 (与动态上传模式保持一致的计算方式)
-            semantic_len = voice_info.get('semantic_len', 0)
-
-            speech_md5 = None
-            # 注意: 预设音色已在 SpeakerManager.load_presets() 时提取特征并存储到共享内存
-            # 因此 need_extract_speech 应该总是 False (因为 have_alloc 应该总是 True)
-            need_extract_speech = False
-        else:
-            # ========== 动态上传音色 (原有逻辑) ==========
-            if not prompt_wav or not prompt_text:
-                return create_error_response(
-                    HTTPStatus.BAD_REQUEST,
-                    "Please provide either spk_id (preset voice) or both prompt_wav and prompt_text (custom voice)"
-                )
-
-            sample_params_dict = {}
-            sampling_params = SamplingParams()
-            sampling_params.init(**sample_params_dict)
-            sampling_params.verify()
-            prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
-
-            prompt_speech_16k = load_wav(prompt_wav.file, 16000)
-            semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
-
-            prompt_wav.file.seek(0)
-            speech_md5 = calculate_md5(prompt_wav.file)
-            speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5=speech_md5, prompt_wav=prompt_speech_16k)
-            need_extract_speech = True and not have_alloc
-
-        tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
-
-        # 初始化 SamplingParams (需要在两种模式下都初始化)
-        if spk_id:
-            sample_params_dict = {}
-            sampling_params = SamplingParams()
-            sampling_params.init(**sample_params_dict)
-            sampling_params.verify()
-
-        generate_objs = []
-
-        request_ids = []
-        for text in tts_texts:
-            cur_req_dict = {
-                "text": text,
-                "spk_id": spk_id,  # 新增字段
-                "prompt_text": prompt_text,
-                "tts_model_name": tts_model_name,
-                "speech_md5": speech_md5,
-                "need_extract_speech": need_extract_speech,
-                "stream": stream,
-                "speech_index": speech_index,
-                "semantic_len": semantic_len,
-                "speed": speed,
-            }
-            need_extract_speech = False
-            request_id = g_id_gen.generate_id()
-            results_generator = g_objs.httpserver_manager.generate(
-                cur_req_dict, request_id, sampling_params, request=request
+    # 检查 spk_id 参数
+    if spk_id:
+        if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(spk_id):
+            available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+            return create_error_response(
+                HTTPStatus.BAD_REQUEST,
+                f"Invalid spk_id '{spk_id}'. Available presets: {available}"
             )
-            generate_objs.append(results_generator)
-            request_ids.append(request_id)
 
-        print(f"split to request_ids: {request_ids}")
-        if stream:
-            try:
-                return StreamingResponse(generate_data_stream(generate_objs))
-            except Exception as e:
-                logger.error("An error occurred: %s", str(e), exc_info=True)
-                return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
-        else:
-            try:
-                ans_objs = []
-                for generator in generate_objs:
-                    async for result in generator:
-                        ans_objs.append(result)
-                return StreamingResponse(generate_data(ans_objs))
-            except Exception as e:
-                logger.error("An error occurred: %s", str(e), exc_info=True)
-                return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
-    finally:
-        inflight_dec()
+        # ========== 预设音色快速路径 (优化后) ==========
+        # 直接使用 spk_id 分配共享内存,无需 MD5 计算
+        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
 
+        # 获取预设音色的详细信息
+        voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
+        prompt_text = voice_info['prompt_text']
+        prompt_speech_16k = None  # 预设音色已在共享内存中,无需再次加载
+
+        # 使用预计算的语义长度 (与动态上传模式保持一致的计算方式)
+        semantic_len = voice_info.get('semantic_len', 0)
+
+        speech_md5 = None
+        # 注意: 预设音色已在 SpeakerManager.load_presets() 时提取特征并存储到共享内存
+        # 因此 need_extract_speech 应该总是 False (因为 have_alloc 应该总是 True)
+        need_extract_speech = False
+    else:
+        # ========== 动态上传音色 (原有逻辑) ==========
+        if not prompt_wav or not prompt_text:
+            return create_error_response(
+                HTTPStatus.BAD_REQUEST,
+                "Please provide either spk_id (preset voice) or both prompt_wav and prompt_text (custom voice)"
+            )
+
+        sample_params_dict = {}
+        sampling_params = SamplingParams()
+        sampling_params.init(**sample_params_dict)
+        sampling_params.verify()
+        prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
+
+        prompt_speech_16k = load_wav(prompt_wav.file, 16000)
+        semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
+
+        prompt_wav.file.seek(0)
+        speech_md5 = calculate_md5(prompt_wav.file)
+        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5=speech_md5, prompt_wav=prompt_speech_16k)
+        need_extract_speech = True and not have_alloc
+
+    tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
+
+    # 初始化 SamplingParams (需要在两种模式下都初始化)
+    if spk_id:
+        sample_params_dict = {}
+        sampling_params = SamplingParams()
+        sampling_params.init(**sample_params_dict)
+        sampling_params.verify()
+
+    generate_objs = []
+
+    request_ids = []
+    for text in tts_texts:
+        cur_req_dict = {
+            "text": text,
+            "spk_id": spk_id,  # 新增字段
+            "prompt_text": prompt_text,
+            "tts_model_name": tts_model_name,
+            "speech_md5": speech_md5,
+            "need_extract_speech": need_extract_speech,
+            "stream": stream,
+            "speech_index": speech_index,
+            "semantic_len": semantic_len,
+            "speed": speed,
+        }
+        need_extract_speech = False
+        request_id = g_id_gen.generate_id()
+        results_generator = g_objs.httpserver_manager.generate(
+            cur_req_dict, request_id, sampling_params, request=request
+        )
+        generate_objs.append(results_generator)
+        request_ids.append(request_id)
+
+    print(f"split to request_ids: {request_ids}")
+    if stream:
+        try:
+            return StreamingResponse(generate_data_stream(generate_objs))
+        except Exception as e:
+            logger.error("An error occurred: %s", str(e), exc_info=True)
+            return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
+    else:
+        try:
+            ans_objs = []
+            for generator in generate_objs:
+                async for result in generator:
+                    ans_objs.append(result)
+            return StreamingResponse(generate_data(ans_objs))    
+        except Exception as e:
+            logger.error("An error occurred: %s", str(e), exc_info=True)
+            return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
 
 @app.post("/query_tts_model")
 @app.get("/query_tts_model")
@@ -515,4 +431,3 @@ async def startup_event():
     logger.info(f"server start up ok, loop use is {asyncio.get_event_loop()}")
     logger.info(f"Listening at: http://{g_objs.args.host}:{g_objs.args.port}")
     return
-

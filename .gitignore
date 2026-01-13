@@ -1,6 +1,6 @@
 test/*.json
 test/*.md
-pretrained_models/
+pretrained_models
 __pycache__/
 .pyc
 build
