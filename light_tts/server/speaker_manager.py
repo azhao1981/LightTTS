@@ -170,13 +170,23 @@ class SpeakerManager:
 
     def is_valid_spk_id(self, spk_id: str) -> bool:
         """检查音色 ID 是否有效，支持 SFT 模式（_sft 后缀）"""
+        # Check voices.yaml (for regular use)
         if spk_id in self.voices:
             return True
 
         # Check SFT mode (remove _sft suffix)
         if spk_id.endswith('_sft'):
             base_spk_id = spk_id[:-4]
-            return base_spk_id in self.voices
+            # Check both voices.yaml and spk2info.pt
+            if base_spk_id in self.voices:
+                return True
+            if hasattr(self.model, 'spk2info') and base_spk_id in self.model.spk2info:
+                return True
+            return False
+
+        # Check spk2info.pt for non-SFT speakers (e.g., fine-tuned speakers)
+        if hasattr(self.model, 'spk2info') and spk_id in self.model.spk2info:
+            return True
 
         return False
 

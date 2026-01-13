@@ -13,6 +13,12 @@ SFT (Supervised Fine-Tuning) 模式是一种优化的语音合成模式，通过
 
 ## 使用方法
 
+python -m light_tts.server.api_server \
+  --model_dir ./pretrained_models/CosyVoice2-0.5B-finetune-v1 \
+  --load_trt True
+
+python test/test_sft_integration.py
+
 ### API 调用
 
 SFT 模式复用现有的 `/inference_zero_shot` 端点，通过 `spk_id` 后缀自动识别模式。
@@ -22,7 +28,7 @@ SFT 模式复用现有的 `/inference_zero_shot` 端点，通过 `spk_id` 后缀
 ```bash
 curl -X POST http://localhost:8080/inference_zero_shot \
   -F "tts_text=你好世界" \
-  -F "spk_id=female_test" \
+  -F "spk_id=female" \
   -o test_zero_shot.wav
 ```
 
@@ -35,6 +41,12 @@ curl -X POST http://localhost:8080/inference_zero_shot \
   -o test_sft.wav
 ```
 
+**注意**：SFT 模式支持两类音色 ID：
+1. **来自 `spk2info.pt`**（推荐）：如 `female_test_sft`, `male1_trained_sft`
+2. **来自 `voices.yaml`**：如 `female_sft`, `male_sft`, `male2_sft`
+
+使用时添加 `_sft` 后缀即可启用 SFT 模式。
+
 ### Python 调用示例
 
 ```python
@@ -45,7 +57,7 @@ response = requests.post(
     "http://localhost:8080/inference_zero_shot",
     data={
         "tts_text": "你好，这是 SFT 模式测试。",
-        "spk_id": "female_test_sft",  # 注意 _sft 后缀
+        "spk_id": "female_test_sft",  # spk2info.pt 中的音色 + _sft 后缀
         "stream": "false"
     }
 )
@@ -59,8 +71,12 @@ if response.status_code == 200:
 
 | 模式 | spk_id 格式 | 示例 |
 |------|------------|------|
-| Zero-Shot | `{base_name}` | `female_test`, `male1_trained` |
-| SFT | `{base_name}_sft` | `female_test_sft`, `male1_trained_sft` |
+| Zero-Shot | `{voice_name}` | `female`, `male`, `female_test`, `male1_trained` |
+| SFT | `{voice_name}_sft` | `female_sft`, `male_sft`, `female_test_sft`, `male1_trained_sft` |
+
+**音色来源**：
+- **`spk2info.pt`**（推荐用于 SFT）：包含 `female_test`, `male1_trained` 等
+- **`voices.yaml`**：包含 `female`, `female_long`, `male`, `male_long`, `male2` 等
 
 ## 技术细节
 
@@ -88,10 +104,10 @@ Request → API → Encode → 直接跳过 → LLM → Decode → Response
 
 | 字段 | Zero-Shot | SFT |
 |------|-----------|-----|
-| `spk_id` | `"female_test"` | `"female_test_sft"` |
-| `speech_index` | `0, 1, 2, ...` | `-1` (无效) |
+| `spk_id` | `"female"` | `"female_sft"` |
+| `speech_index` | `0, 1, 2, ...` | 有效索引（复用现有机制） |
 | `semantic_len` | `382` (语音token数) | `0` (无语音) |
-| `need_extract_speech` | `False` (预设音色已缓存) | `False` (不需要) |
+| `need_extract_speech` | `False` (预设音色已缓存) | `False` (embedding 已在 API 层提取) |
 | `prompt_text` | `"参考文本"` | `""` (空字符串) |
 | LLM 输入字段 | **12 个** | **4 个** |
 
@@ -138,9 +154,9 @@ curl -X POST http://localhost:8080/inference_zero_shot \
 
 SFT 模式有以下日志标记：
 
-- API 层：`🎯 SFT mode detected: spk_id=..., base_spk_id=...`
-- Encode 层：`🎯 SFT mode: req_id ..., spk_id=..., skipping speech extraction`
-- 发送到 LLM：`Send: ... | SFT mode (no speech) to tts_llm`
+- API 层：`SFT mode: extracted embedding for spk_id=..., base_spk_id=...`
+- Encode 层：`SFT mode: req_id ..., spk_id=..., embedding shape=...`
+- 发送到 LLM：`Send: ... | mode=SFT to tts_llm`
 
 ## 错误处理
 
@@ -148,7 +164,7 @@ SFT 模式有以下日志标记：
 
 ```json
 {
-  "message": "Invalid SFT spk_id 'invalid_sft'. Base spk_id 'invalid' not found. Available presets: ['female_test', 'male1_trained']"
+  "message": "Invalid SFT spk_id 'invalid_sft'. Base spk_id 'invalid' not found. Available presets: ['female', 'male', 'male2'] (from voices.yaml) or check spk2info.pt for additional speakers like 'female_test', 'male1_trained'"
 }
 ```
 
@@ -156,7 +172,7 @@ SFT 模式有以下日志标记：
 
 ```json
 {
-  "message": "SFT speaker 'female_test_sft' not found in spk2info"
+  "message": "Invalid SFT spk_id 'unknown_sft'. Base spk_id 'unknown' not found. Available presets: ['female', 'male', 'male2'] (from voices.yaml) or check spk2info.pt for additional speakers"
 }
 ```
 
@@ -230,29 +246,21 @@ speech_token, speech_feat, embedding = self.shared_speech_manager.get_index_spee
 
 ### 模型要求
 
-- `spk2info.pt` 必须包含基础音色（如 `female_test`, `male1_trained`）
-- 基础音色的 `embedding` 字段必须存在
+- `voices.yaml` 必须包含基础音色（如 `female`, `male`, `male2`）
+- `spk2info.pt` 必须包含基础音色的 `embedding` 字段
+- 音色的参考音频文件必须存在于 `assets/` 目录
 
-### 验证模型
+### 验证配置
 
 ```bash
-python3 -c "
-import torch
-spk2info = torch.load('pretrained_models/CosyVoice2-0.5B-finetune-v1/spk2info.pt', map_location='cpu')
+# 检查 voices.yaml 中的音色
+cat voices.yaml
 
-print('=== 可用音色 ===')
-for spk_id in spk2info.keys():
-    print(f'  {spk_id}')
-
-# 验证包含必要的基础音色
-required = ['female_test', 'male1_trained']
-for spk_id in required:
-    if spk_id in spk2info:
-        print(f'✅ {spk_id} 存在')
-        print(f'   embedding 维度: {spk2info[spk_id][\"llm_embedding\"].shape}')
-    else:
-        print(f'❌ {spk_id} 不存在')
-"
+# 输出示例：
+# voices:
+#   - name: female
+#   - name: male
+#   - name: male2
 ```
 
 ## 常见问题

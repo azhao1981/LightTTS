@@ -277,38 +277,73 @@ async def inference_zero_shot(
 
     # SFT mode detection
     is_sft = spk_id.endswith('_sft') if spk_id else False
+    logger.info(f"[API] spk_id={spk_id}, is_sft={is_sft}")
 
     # Check spk_id parameter
     if spk_id:
         if is_sft:
             # SFT mode path
             base_spk_id = spk_id[:-4]
+            logger.info(f"[API SFT] base_spk_id={base_spk_id}, checking validity...")
+
+            # Debug: check frontend.spk2info
+            if hasattr(g_objs.frontend, 'spk2info'):
+                logger.info(f"[API SFT] frontend.spk2info keys: {list(g_objs.frontend.spk2info.keys())}")
+                logger.info(f"[API SFT] base_spk_id in frontend.spk2info: {base_spk_id in g_objs.frontend.spk2info}")
+
             if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(base_spk_id):
                 available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+                logger.error(f"[API SFT] Validation failed! base_spk_id={base_spk_id}, available={available}")
                 return create_error_response(
                     HTTPStatus.BAD_REQUEST,
                     f"Invalid SFT spk_id '{spk_id}'. Base spk_id '{base_spk_id}' not found. Available presets: {available}"
                 )
 
-            # Call frontend_sft to get embedding
+            logger.info(f"[API SFT] Validation passed for base_spk_id={base_spk_id}")
+
+            # SFT mode: extract features from spk2info
             try:
-                model_input = g_objs.frontend.frontend_sft(tts_text, base_spk_id)
-                llm_embedding = model_input['llm_embedding'].cpu().numpy()
-                logger.info(f"SFT mode: extracted embedding for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
+                if base_spk_id not in g_objs.frontend.spk2info:
+                    raise ValueError(f"Speaker '{base_spk_id}' not found in spk2info")
+
+                spk_info = g_objs.frontend.spk2info[base_spk_id]
+
+                # Handle different spk2info formats
+                if 'llm_embedding' in spk_info:
+                    llm_embedding = spk_info['llm_embedding'].cpu().numpy()
+                    logger.info(f"SFT mode: extracted llm_embedding from spk2info for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
+                elif 'embedding' in spk_info:
+                    llm_embedding = spk_info['embedding'].cpu().numpy()
+                    logger.info(f"SFT mode: extracted embedding from spk2info for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
+                else:
+                    raise ValueError(f"No embedding found in spk2info for '{base_spk_id}'. Available keys: {list(spk_info.keys())}")
+
+                # Extract speech features if available (for zero-shot format spk2info)
+                speech_token = spk_info.get('llm_prompt_speech_token', torch.tensor([])).cpu().numpy()
+                speech_feat = spk_info.get('prompt_speech_feat', torch.tensor([])).cpu().numpy()
+
+                # Handle speech_feat shape (squeeze if needed)
+                if len(speech_feat.shape) == 3 and speech_feat.shape[0] == 1:
+                    speech_feat = speech_feat.squeeze(0)
+
             except Exception as e:
-                logger.error(f"SFT mode frontend_sft failed: {e}")
+                logger.error(f"SFT mode feature extraction failed: {e}", exc_info=True)
                 return create_error_response(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    f"SFT mode frontend processing failed: {str(e)}"
+                    f"SFT mode feature extraction failed: {str(e)}"
                 )
 
-            # Allocate speech_index and store embedding to shared memory
+            # Allocate shared memory and store features
             speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
-            empty_speech_token = np.array([], dtype=np.int32)
-            empty_speech_feat = np.array([], dtype=np.float32).reshape(0, 80)
-            g_objs.httpserver_manager.shared_speech_manager.set_index_speech(
-                speech_index, empty_speech_token, empty_speech_feat, llm_embedding
-            )
+
+            if not have_alloc:
+                # First time using this speaker: store features to shared memory
+                g_objs.httpserver_manager.shared_speech_manager.set_index_speech(
+                    speech_index, speech_token, speech_feat, llm_embedding
+                )
+                logger.info(f"SFT mode: stored features to shared memory for spk_id={spk_id}, speech_index={speech_index}")
+            else:
+                logger.info(f"SFT mode: using cached shared memory for spk_id={spk_id}, speech_index={speech_index}")
 
             semantic_len = 0
             need_extract_speech = False
@@ -426,10 +461,39 @@ async def query_preset_voices(request: Request) -> Response:
             "presets": stats['available_spk_ids'],
             "loaded_count": stats['loaded'],
             "failed_count": stats['failed'],
-            "total_count": stats['total']
         }
-    json_data = json.dumps(data, ensure_ascii=False)
+    json_data = json.dumps(data)
     return Response(content=json_data, media_type="application/json")
+
+@app.get("/debug_sft")
+async def debug_sft_status():
+    """调试 SFT 模式状态"""
+    if not g_objs.speaker_manager or not g_objs.frontend:
+        return JSONResponse({"error": "Server not fully initialized"})
+
+    # 获取 spk2info 状态
+    spk2info_keys = []
+    if hasattr(g_objs.frontend, 'spk2info') and g_objs.frontend.spk2info:
+        spk2info_keys = list(g_objs.frontend.spk2info.keys())
+
+    # 获取 voices.yaml 中的音色
+    voices_keys = []
+    if g_objs.speaker_manager.voices:
+        voices_keys = list(g_objs.speaker_manager.voices.keys())
+
+    # 测试几个音色的有效性
+    test_spk_ids = ['female', 'female_test', 'female_test_sft', 'male1_trained', 'male1_trained_sft']
+    validation_results = {}
+    for spk_id in test_spk_ids:
+        validation_results[spk_id] = g_objs.speaker_manager.is_valid_spk_id(spk_id)
+
+    return JSONResponse({
+        "frontend.spk2info_keys": spk2info_keys,
+        "speaker_manager.voices_keys": voices_keys,
+        "validation_results": validation_results,
+        "has_frontend_spk2info": hasattr(g_objs.frontend, 'spk2info'),
+        "frontend_type": str(type(g_objs.frontend)),
+    })
 
 @app.get("/metrics")
 async def metrics() -> Response:

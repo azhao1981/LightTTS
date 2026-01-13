@@ -5,23 +5,29 @@ SFT 模式集成测试
 
 运行测试前，确保：
 1. 服务器已启动：python -m light_tts.server.api_server --model_dir ./pretrained_models/CosyVoice2-0.5B-finetune-v1
-2. 模型包含基础音色：female_test, male1_trained
+2. 模型 spk2info.pt 包含基础音色：female_test, male1_trained
+3. voices.yaml 包含预设音色：female, male, male2 等
 """
 
 import requests
 import pytest
+import time
+import soundfile as sf
+import numpy as np
+import os
 
 
 API_BASE = "http://localhost:8080"
+os.makedirs("./outs", exist_ok=True)
 
 
 def test_sft_spk_id_detection():
     """测试 SFT 模式 spk_id 检测逻辑"""
     # 测试 _sft 后缀检测
-    assert "female_test_sft".endswith('_sft') == True
-    assert "male1_trained_sft".endswith('_sft') == True
-    assert "female_test".endswith('_sft') == False
-    assert "male1_trained".endswith('_sft') == False
+    assert "female_test_sft".endswith('_sft')
+    assert "male1_trained_sft".endswith('_sft')
+    assert not "female_test".endswith('_sft')
+    assert not "male1_trained".endswith('_sft')
 
     # 测试基础 spk_id 提取
     assert "female_test_sft"[:-4] == "female_test"
@@ -30,20 +36,35 @@ def test_sft_spk_id_detection():
 
 def test_sft_api_basic():
     """测试 SFT API 基本功能"""
+    start_time = time.time()
     response = requests.post(
         f"{API_BASE}/inference_zero_shot",
         data={
             "tts_text": "你好，这是 SFT 模式测试。",
-            "spk_id": "female_test_sft",
-            "stream": "false"
-        }
+            "spk_id": "female_test_sft",  # 使用 spk2info.pt 中的音色 + _sft 后缀
+            "stream": "true"
+        },
+        stream=True,
+        timeout=30  # 30秒超时
     )
 
     # 应该返回 200（如果音色存在）
     # 或者返回 400（如果音色不存在但错误信息正确）
     if response.status_code == 200:
-        assert len(response.content) > 0
-        print("✅ SFT API 基本功能测试通过")
+        audio_data = bytearray()
+        for chunk in response.iter_content(chunk_size=4096):
+            if chunk:
+                audio_data.extend(chunk)
+
+        cost_time = time.time() - start_time
+        audio_np = np.frombuffer(audio_data, dtype=np.int16)
+        speech_len = len(audio_data) / 2 / 24000
+
+        output_wav = "./outs/sft_test_output.wav"
+        sf.write(output_wav, audio_np, samplerate=24000, subtype="PCM_16")
+
+        assert len(audio_data) > 0
+        print(f"✅ SFT API 基本功能测试通过, 保存为 {output_wav}, 耗时: {cost_time:.2f}s, RTF: {cost_time/speech_len:.2f}")
     elif response.status_code == 400:
         # 检查是否是预期的错误信息
         error_msg = response.json().get("message", "")
@@ -61,7 +82,8 @@ def test_sft_invalid_spk_id():
         data={
             "tts_text": "测试",
             "spk_id": "invalid_sft",
-        }
+        },
+        timeout=10  # 10秒超时
     )
 
     assert response.status_code == 400
@@ -76,9 +98,10 @@ def test_zero_shot_unchanged():
         f"{API_BASE}/inference_zero_shot",
         data={
             "tts_text": "你好世界",
-            "spk_id": "female_test",
+            "spk_id": "female_0test",  # 使用 spk2info.pt 中的音色
             "stream": "false"
-        }
+        },
+        timeout=30  # 30秒超时
     )
 
     if response.status_code == 200:
@@ -131,18 +154,18 @@ if __name__ == "__main__":
     print("\n[2/5] 测试 SFT API 基本功能...")
     test_sft_api_basic()
 
-    # 测试 3: 无效 spk_id 错误处理
-    print("\n[3/5] 测试无效 spk_id 错误处理...")
-    test_sft_invalid_spk_id()
+    # # 测试 3: 无效 spk_id 错误处理
+    # print("\n[3/5] 测试无效 spk_id 错误处理...")
+    # test_sft_invalid_spk_id()
 
-    # 测试 4: Zero-Shot 模式不受影响
-    print("\n[4/5] 测试 Zero-Shot 模式不受影响...")
-    test_zero_shot_unchanged()
+    # # 测试 4: Zero-Shot 模式不受影响
+    # print("\n[4/5] 测试 Zero-Shot 模式不受影响...")
+    # test_zero_shot_unchanged()
 
-    # 测试 5: SFT vs Zero-Shot 对比
-    print("\n[5/5] 测试 SFT vs Zero-Shot 对比...")
-    test_sft_vs_zero_shot_comparison()
+    # # 测试 5: SFT vs Zero-Shot 对比
+    # print("\n[5/5] 测试 SFT vs Zero-Shot 对比...")
+    # test_sft_vs_zero_shot_comparison()
 
-    print("\n" + "=" * 60)
-    print("所有测试完成！")
-    print("=" * 60)
+    # print("\n" + "=" * 60)
+    # print("所有测试完成！")
+    # print("=" * 60)
