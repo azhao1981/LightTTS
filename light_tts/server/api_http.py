@@ -275,31 +275,62 @@ async def inference_zero_shot(
     if tts_model_name == "default":
         tts_model_name = lora_styles[0]
 
-    # 检查 spk_id 参数
+    # SFT mode detection
+    is_sft = spk_id.endswith('_sft') if spk_id else False
+
+    # Check spk_id parameter
     if spk_id:
-        if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(spk_id):
-            available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
-            return create_error_response(
-                HTTPStatus.BAD_REQUEST,
-                f"Invalid spk_id '{spk_id}'. Available presets: {available}"
+        if is_sft:
+            # SFT mode path
+            base_spk_id = spk_id[:-4]
+            if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(base_spk_id):
+                available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Invalid SFT spk_id '{spk_id}'. Base spk_id '{base_spk_id}' not found. Available presets: {available}"
+                )
+
+            # Call frontend_sft to get embedding
+            try:
+                model_input = g_objs.frontend.frontend_sft(tts_text, base_spk_id)
+                llm_embedding = model_input['llm_embedding'].cpu().numpy()
+                logger.info(f"SFT mode: extracted embedding for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
+            except Exception as e:
+                logger.error(f"SFT mode frontend_sft failed: {e}")
+                return create_error_response(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    f"SFT mode frontend processing failed: {str(e)}"
+                )
+
+            # Allocate speech_index and store embedding to shared memory
+            speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
+            empty_speech_token = np.array([], dtype=np.int32)
+            empty_speech_feat = np.array([], dtype=np.float32).reshape(0, 80)
+            g_objs.httpserver_manager.shared_speech_manager.set_index_speech(
+                speech_index, empty_speech_token, empty_speech_feat, llm_embedding
             )
 
-        # ========== 预设音色快速路径 (优化后) ==========
-        # 直接使用 spk_id 分配共享内存,无需 MD5 计算
-        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
+            semantic_len = 0
+            need_extract_speech = False
+            prompt_text = ''
+            prompt_speech_16k = None
+            speech_md5 = None
+        else:
+            # Zero-shot mode: preset voice path
+            if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(spk_id):
+                available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Invalid spk_id '{spk_id}'. Available presets: {available}"
+                )
 
-        # 获取预设音色的详细信息
-        voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
-        prompt_text = voice_info['prompt_text']
-        prompt_speech_16k = None  # 预设音色已在共享内存中,无需再次加载
-
-        # 使用预计算的语义长度 (与动态上传模式保持一致的计算方式)
-        semantic_len = voice_info.get('semantic_len', 0)
-
-        speech_md5 = None
-        # 注意: 预设音色已在 SpeakerManager.load_presets() 时提取特征并存储到共享内存
-        # 因此 need_extract_speech 应该总是 False (因为 have_alloc 应该总是 True)
-        need_extract_speech = False
+            speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
+            voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
+            prompt_text = voice_info['prompt_text']
+            prompt_speech_16k = None
+            semantic_len = voice_info.get('semantic_len', 0)
+            speech_md5 = None
+            need_extract_speech = False
     else:
         # ========== 动态上传音色 (原有逻辑) ==========
         if not prompt_wav or not prompt_text:

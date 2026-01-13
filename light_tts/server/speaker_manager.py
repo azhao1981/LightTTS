@@ -169,8 +169,16 @@ class SpeakerManager:
             return False
 
     def is_valid_spk_id(self, spk_id: str) -> bool:
-        """检查音色 ID 是否有效"""
-        return spk_id in self.voices
+        """检查音色 ID 是否有效，支持 SFT 模式（_sft 后缀）"""
+        if spk_id in self.voices:
+            return True
+
+        # Check SFT mode (remove _sft suffix)
+        if spk_id.endswith('_sft'):
+            base_spk_id = spk_id[:-4]
+            return base_spk_id in self.voices
+
+        return False
 
     def list_available_spks(self) -> List[str]:
         """获取所有可用的音色 ID"""
