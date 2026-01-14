@@ -150,6 +150,86 @@ def liveness():
 def readiness():
     return {"status": "ok"}
 
+
+from pynvml import (
+    nvmlInit,
+    nvmlDeviceGetHandleByIndex,
+    nvmlDeviceGetMemoryInfo,
+    nvmlDeviceGetUtilizationRates,
+)
+import threading
+# =========================
+# GPU / TTS 调度状态（单卡单进程）
+# =========================
+
+# 对当前进程而言，GPU index 永远是 0（CUDA_VISIBLE_DEVICES 已隔离）
+nvmlInit()
+def get_nvml_handle_from_cuda_visible_devices():
+    """
+    返回当前进程实际使用的物理 GPU 的 NVML handle
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+    if not visible:
+        # 没设置，默认用物理 0（不推荐生产这样跑）
+        return nvmlDeviceGetHandleByIndex(0)
+
+    # CUDA_VISIBLE_DEVICES 可能是 "1" / "0,2" / "3,4"
+    physical_ids = [int(x) for x in visible.split(",") if x.strip() != ""]
+
+    # 单卡单进程：只取第一个
+    physical_gpu_id = physical_ids[0]
+
+    return nvmlDeviceGetHandleByIndex(physical_gpu_id)
+_nvml_handle = get_nvml_handle_from_cuda_visible_devices()
+_MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", "6"))
+
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+def inflight_inc():
+    global _inflight
+    with _inflight_lock:
+        _inflight += 1
+
+def inflight_dec():
+    global _inflight
+    with _inflight_lock:
+        _inflight -= 1
+        if _inflight < 0:
+            _inflight = 0
+
+def inflight_get():
+    with _inflight_lock:
+        return _inflight
+@app.get("/healthz_gpu")
+async def healthz_gpu():
+    """
+    ⚠️ 仅用于调度器（Dispatcher）
+    返回 GPU 驱动级状态 + TTS inflight
+    """
+
+    mem = nvmlDeviceGetMemoryInfo(_nvml_handle)
+    util = nvmlDeviceGetUtilizationRates(_nvml_handle)
+
+    total_mb = mem.total // (1024 * 1024)
+    used_mb = mem.used // (1024 * 1024)
+    free_mb = mem.free // (1024 * 1024)
+
+    return {
+        "gpu_id": 0,
+        "gpu": {
+            "total_mb": total_mb,
+            "used_mb": used_mb,
+            "free_mb": free_mb,
+            "util_percent": util.gpu,
+        },
+        "tts": {
+            "inflight": inflight_get(),
+            "max_inflight": _MAX_INFLIGHT,
+        }
+    }
+
 def generate_data(model_output):
     for i in model_output:
         tts_audio = (i['tts_speech'] * (2 ** 15)).astype(np.int16).tobytes()
@@ -266,193 +346,197 @@ async def inference_zero_shot(
         tts_model_name: str = Form(default="default"),
         speed: float = Form(default=1.0),
     ):
-    all_request_counter.inc()
-    global lora_styles
+    try:
+        inflight_inc()
+        all_request_counter.inc()
+        global lora_styles
 
-    if stream and speed != 1.0:
-        return create_error_response(HTTPStatus.BAD_REQUEST, "speed change only support non-stream inference mode")
+        if stream and speed != 1.0:
+            return create_error_response(HTTPStatus.BAD_REQUEST, "speed change only support non-stream inference mode")
 
-    if tts_model_name == "default":
-        tts_model_name = lora_styles[0]
+        if tts_model_name == "default":
+            tts_model_name = lora_styles[0]
 
-    # SFT mode detection
-    is_sft = spk_id.endswith('_sft') if spk_id else False
-    logger.info(f"[API] spk_id={spk_id}, is_sft={is_sft}")
+        # SFT mode detection
+        is_sft = spk_id.endswith('_sft') if spk_id else False
+        logger.info(f"[API] spk_id={spk_id}, is_sft={is_sft}")
 
-    # Initialize prompt_text_ids (used for SFT mode with cached zero-shot data)
-    prompt_text_ids = None
+        # Initialize prompt_text_ids (used for SFT mode with cached zero-shot data)
+        prompt_text_ids = None
 
-    # Check spk_id parameter
-    if spk_id:
-        if is_sft:
-            # SFT mode path
-            base_spk_id = spk_id[:-4]
-            logger.info(f"[API SFT] base_spk_id={base_spk_id}, checking validity...")
+        # Check spk_id parameter
+        if spk_id:
+            if is_sft:
+                # SFT mode path
+                base_spk_id = spk_id[:-4]
+                logger.info(f"[API SFT] base_spk_id={base_spk_id}, checking validity...")
 
-            # Debug: check frontend.spk2info
-            if hasattr(g_objs.frontend, 'spk2info'):
-                logger.info(f"[API SFT] frontend.spk2info keys: {list(g_objs.frontend.spk2info.keys())}")
-                logger.info(f"[API SFT] base_spk_id in frontend.spk2info: {base_spk_id in g_objs.frontend.spk2info}")
+                # Debug: check frontend.spk2info
+                if hasattr(g_objs.frontend, 'spk2info'):
+                    logger.info(f"[API SFT] frontend.spk2info keys: {list(g_objs.frontend.spk2info.keys())}")
+                    logger.info(f"[API SFT] base_spk_id in frontend.spk2info: {base_spk_id in g_objs.frontend.spk2info}")
 
-            if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(base_spk_id):
-                available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
-                logger.error(f"[API SFT] Validation failed! base_spk_id={base_spk_id}, available={available}")
-                return create_error_response(
-                    HTTPStatus.BAD_REQUEST,
-                    f"Invalid SFT spk_id '{spk_id}'. Base spk_id '{base_spk_id}' not found. Available presets: {available}"
-                )
+                if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(base_spk_id):
+                    available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+                    logger.error(f"[API SFT] Validation failed! base_spk_id={base_spk_id}, available={available}")
+                    return create_error_response(
+                        HTTPStatus.BAD_REQUEST,
+                        f"Invalid SFT spk_id '{spk_id}'. Base spk_id '{base_spk_id}' not found. Available presets: {available}"
+                    )
 
-            logger.info(f"[API SFT] Validation passed for base_spk_id={base_spk_id}")
+                logger.info(f"[API SFT] Validation passed for base_spk_id={base_spk_id}")
 
-            # SFT mode: extract features from spk2info
-            try:
-                if base_spk_id not in g_objs.frontend.spk2info:
-                    raise ValueError(f"Speaker '{base_spk_id}' not found in spk2info")
+                # SFT mode: extract features from spk2info
+                try:
+                    if base_spk_id not in g_objs.frontend.spk2info:
+                        raise ValueError(f"Speaker '{base_spk_id}' not found in spk2info")
 
-                spk_info = g_objs.frontend.spk2info[base_spk_id]
+                    spk_info = g_objs.frontend.spk2info[base_spk_id]
 
-                # Handle different spk2info formats
-                if 'llm_embedding' in spk_info:
-                    llm_embedding = spk_info['llm_embedding'].cpu().numpy()
-                    logger.info(f"SFT mode: extracted llm_embedding from spk2info for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
-                elif 'embedding' in spk_info:
-                    llm_embedding = spk_info['embedding'].cpu().numpy()
-                    logger.info(f"SFT mode: extracted embedding from spk2info for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
+                    # Handle different spk2info formats
+                    if 'llm_embedding' in spk_info:
+                        llm_embedding = spk_info['llm_embedding'].cpu().numpy()
+                        logger.info(f"SFT mode: extracted llm_embedding from spk2info for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
+                    elif 'embedding' in spk_info:
+                        llm_embedding = spk_info['embedding'].cpu().numpy()
+                        logger.info(f"SFT mode: extracted embedding from spk2info for spk_id={spk_id}, base_spk_id={base_spk_id}, shape={llm_embedding.shape}")
+                    else:
+                        raise ValueError(f"No embedding found in spk2info for '{base_spk_id}'. Available keys: {list(spk_info.keys())}")
+
+                    # Extract speech features if available (for zero-shot format spk2info)
+                    speech_token = spk_info.get('llm_prompt_speech_token', torch.tensor([])).cpu().numpy()
+                    speech_feat = spk_info.get('prompt_speech_feat', torch.tensor([])).cpu().numpy()
+
+                    # Extract prompt_text token IDs from spk2info (for cached zero-shot format)
+                    # This is critical for proper LLM input structure
+                    prompt_text_tensor = spk_info.get('prompt_text', torch.tensor([]))
+                    if prompt_text_tensor.numel() > 0:
+                        # prompt_text is stored as token IDs, convert to list
+                        prompt_text_ids = prompt_text_tensor.flatten().tolist()
+                        logger.info(f"SFT mode: extracted prompt_text_ids from spk2info, len={len(prompt_text_ids)}")
+                    else:
+                        prompt_text_ids = []
+                        logger.info(f"SFT mode: no prompt_text in spk2info, using empty")
+
+                    # Handle speech_feat shape (squeeze if needed)
+                    if len(speech_feat.shape) == 3 and speech_feat.shape[0] == 1:
+                        speech_feat = speech_feat.squeeze(0)
+
+                except Exception as e:
+                    logger.error(f"SFT mode feature extraction failed: {e}", exc_info=True)
+                    return create_error_response(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        f"SFT mode feature extraction failed: {str(e)}"
+                    )
+
+                # Allocate shared memory and store features
+                speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
+
+                if not have_alloc:
+                    # First time using this speaker: store features to shared memory
+                    g_objs.httpserver_manager.shared_speech_manager.set_index_speech(
+                        speech_index, speech_token, speech_feat, llm_embedding
+                    )
+                    logger.info(f"SFT mode: stored features to shared memory for spk_id={spk_id}, speech_index={speech_index}")
                 else:
-                    raise ValueError(f"No embedding found in spk2info for '{base_spk_id}'. Available keys: {list(spk_info.keys())}")
+                    logger.info(f"SFT mode: using cached shared memory for spk_id={spk_id}, speech_index={speech_index}")
 
-                # Extract speech features if available (for zero-shot format spk2info)
-                speech_token = spk_info.get('llm_prompt_speech_token', torch.tensor([])).cpu().numpy()
-                speech_feat = spk_info.get('prompt_speech_feat', torch.tensor([])).cpu().numpy()
-
-                # Extract prompt_text token IDs from spk2info (for cached zero-shot format)
-                # This is critical for proper LLM input structure
-                prompt_text_tensor = spk_info.get('prompt_text', torch.tensor([]))
-                if prompt_text_tensor.numel() > 0:
-                    # prompt_text is stored as token IDs, convert to list
-                    prompt_text_ids = prompt_text_tensor.flatten().tolist()
-                    logger.info(f"SFT mode: extracted prompt_text_ids from spk2info, len={len(prompt_text_ids)}")
-                else:
-                    prompt_text_ids = []
-                    logger.info(f"SFT mode: no prompt_text in spk2info, using empty")
-
-                # Handle speech_feat shape (squeeze if needed)
-                if len(speech_feat.shape) == 3 and speech_feat.shape[0] == 1:
-                    speech_feat = speech_feat.squeeze(0)
-
-            except Exception as e:
-                logger.error(f"SFT mode feature extraction failed: {e}", exc_info=True)
-                return create_error_response(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    f"SFT mode feature extraction failed: {str(e)}"
-                )
-
-            # Allocate shared memory and store features
-            speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
-
-            if not have_alloc:
-                # First time using this speaker: store features to shared memory
-                g_objs.httpserver_manager.shared_speech_manager.set_index_speech(
-                    speech_index, speech_token, speech_feat, llm_embedding
-                )
-                logger.info(f"SFT mode: stored features to shared memory for spk_id={spk_id}, speech_index={speech_index}")
+                semantic_len = 0  # Will be set by encode process based on speech_token length
+                need_extract_speech = False
+                prompt_text = ''  # Not used when prompt_text_ids is provided
+                prompt_speech_16k = None
+                speech_md5 = None
             else:
-                logger.info(f"SFT mode: using cached shared memory for spk_id={spk_id}, speech_index={speech_index}")
+                # Zero-shot mode: preset voice path
+                if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(spk_id):
+                    available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+                    return create_error_response(
+                        HTTPStatus.BAD_REQUEST,
+                        f"Invalid spk_id '{spk_id}'. Available presets: {available}"
+                    )
 
-            semantic_len = 0  # Will be set by encode process based on speech_token length
-            need_extract_speech = False
-            prompt_text = ''  # Not used when prompt_text_ids is provided
-            prompt_speech_16k = None
-            speech_md5 = None
+                speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
+                voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
+                prompt_text = voice_info['prompt_text']
+                prompt_speech_16k = None
+                semantic_len = voice_info.get('semantic_len', 0)
+                speech_md5 = None
+                need_extract_speech = False
         else:
-            # Zero-shot mode: preset voice path
-            if not g_objs.speaker_manager or not g_objs.speaker_manager.is_valid_spk_id(spk_id):
-                available = g_objs.speaker_manager.list_available_spks() if g_objs.speaker_manager else []
+            # ========== 动态上传音色 (原有逻辑) ==========
+            if not prompt_wav or not prompt_text:
                 return create_error_response(
                     HTTPStatus.BAD_REQUEST,
-                    f"Invalid spk_id '{spk_id}'. Available presets: {available}"
+                    "Please provide either spk_id (preset voice) or both prompt_wav and prompt_text (custom voice)"
                 )
 
-            speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(spk_id=spk_id)
-            voice_info = g_objs.speaker_manager.get_voice_info(spk_id)
-            prompt_text = voice_info['prompt_text']
-            prompt_speech_16k = None
-            semantic_len = voice_info.get('semantic_len', 0)
-            speech_md5 = None
+            sample_params_dict = {}
+            sampling_params = SamplingParams()
+            sampling_params.init(**sample_params_dict)
+            sampling_params.verify()
+            prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
+
+            prompt_speech_16k = load_wav(prompt_wav.file, 16000)
+            semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
+
+            prompt_wav.file.seek(0)
+            speech_md5 = calculate_md5(prompt_wav.file)
+            speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5=speech_md5, prompt_wav=prompt_speech_16k)
+            need_extract_speech = True and not have_alloc
+
+        tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
+
+        # 初始化 SamplingParams (需要在两种模式下都初始化)
+        if spk_id:
+            sample_params_dict = {}
+            sampling_params = SamplingParams()
+            sampling_params.init(**sample_params_dict)
+            sampling_params.verify()
+
+        generate_objs = []
+
+        request_ids = []
+        for text in tts_texts:
+            cur_req_dict = {
+                "text": text,
+                "spk_id": spk_id,  # 新增字段
+                "prompt_text": prompt_text,
+                "prompt_text_ids": prompt_text_ids,  # Pre-computed token IDs for SFT mode
+                "tts_model_name": tts_model_name,
+                "speech_md5": speech_md5,
+                "need_extract_speech": need_extract_speech,
+                "stream": stream,
+                "speech_index": speech_index,
+                "semantic_len": semantic_len,
+                "speed": speed,
+            }
             need_extract_speech = False
-    else:
-        # ========== 动态上传音色 (原有逻辑) ==========
-        if not prompt_wav or not prompt_text:
-            return create_error_response(
-                HTTPStatus.BAD_REQUEST,
-                "Please provide either spk_id (preset voice) or both prompt_wav and prompt_text (custom voice)"
+            request_id = g_id_gen.generate_id()
+            results_generator = g_objs.httpserver_manager.generate(
+                cur_req_dict, request_id, sampling_params, request=request
             )
+            generate_objs.append(results_generator)
+            request_ids.append(request_id)
 
-        sample_params_dict = {}
-        sampling_params = SamplingParams()
-        sampling_params.init(**sample_params_dict)
-        sampling_params.verify()
-        prompt_text = g_objs.frontend.text_normalize(prompt_text, split=False)
-
-        prompt_speech_16k = load_wav(prompt_wav.file, 16000)
-        semantic_len = (prompt_speech_16k.shape[1] + 239) // 640 + 10 # + 10 for safe
-
-        prompt_wav.file.seek(0)
-        speech_md5 = calculate_md5(prompt_wav.file)
-        speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5=speech_md5, prompt_wav=prompt_speech_16k)
-        need_extract_speech = True and not have_alloc
-
-    tts_texts = g_objs.frontend.text_normalize(tts_text, split=True)
-
-    # 初始化 SamplingParams (需要在两种模式下都初始化)
-    if spk_id:
-        sample_params_dict = {}
-        sampling_params = SamplingParams()
-        sampling_params.init(**sample_params_dict)
-        sampling_params.verify()
-
-    generate_objs = []
-
-    request_ids = []
-    for text in tts_texts:
-        cur_req_dict = {
-            "text": text,
-            "spk_id": spk_id,  # 新增字段
-            "prompt_text": prompt_text,
-            "prompt_text_ids": prompt_text_ids,  # Pre-computed token IDs for SFT mode
-            "tts_model_name": tts_model_name,
-            "speech_md5": speech_md5,
-            "need_extract_speech": need_extract_speech,
-            "stream": stream,
-            "speech_index": speech_index,
-            "semantic_len": semantic_len,
-            "speed": speed,
-        }
-        need_extract_speech = False
-        request_id = g_id_gen.generate_id()
-        results_generator = g_objs.httpserver_manager.generate(
-            cur_req_dict, request_id, sampling_params, request=request
-        )
-        generate_objs.append(results_generator)
-        request_ids.append(request_id)
-
-    print(f"split to request_ids: {request_ids}")
-    if stream:
-        try:
-            return StreamingResponse(generate_data_stream(generate_objs))
-        except Exception as e:
-            logger.error("An error occurred: %s", str(e), exc_info=True)
-            return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
-    else:
-        try:
-            ans_objs = []
-            for generator in generate_objs:
-                async for result in generator:
-                    ans_objs.append(result)
-            return StreamingResponse(generate_data(ans_objs))    
-        except Exception as e:
-            logger.error("An error occurred: %s", str(e), exc_info=True)
-            return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
+        print(f"split to request_ids: {request_ids}")
+        if stream:
+            try:
+                return StreamingResponse(generate_data_stream(generate_objs))
+            except Exception as e:
+                logger.error("An error occurred: %s", str(e), exc_info=True)
+                return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
+        else:
+            try:
+                ans_objs = []
+                for generator in generate_objs:
+                    async for result in generator:
+                        ans_objs.append(result)
+                return StreamingResponse(generate_data(ans_objs))
+            except Exception as e:
+                logger.error("An error occurred: %s", str(e), exc_info=True)
+                return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
+    finally:
+        inflight_dec()
 
 @app.post("/query_tts_model")
 @app.get("/query_tts_model")
@@ -476,8 +560,9 @@ async def query_preset_voices(request: Request) -> Response:
             "presets": stats['available_spk_ids'],
             "loaded_count": stats['loaded'],
             "failed_count": stats['failed'],
+            "total_count": stats['total']
         }
-    json_data = json.dumps(data)
+    json_data = json.dumps(data, ensure_ascii=False)
     return Response(content=json_data, media_type="application/json")
 
 @app.get("/debug_sft")
