@@ -102,7 +102,52 @@ class TTS1EncodeManager:
                     speech_index = req.speech_index
                     need_extract_speech = req.need_extract_speech
 
+                    spk_id = getattr(req, 'spk_id', '')
+                    is_sft = spk_id.endswith('_sft') if spk_id else False
+
                     n -= 1
+
+                    # SFT mode branch
+                    if is_sft:
+                        base_spk_id = spk_id[:-4]
+
+                        # Wait for embedding data to be ready (stored by API layer)
+                        if not self.shared_speech_manager.speech_data_ready(speech_index):
+                            self.waiting_reqs.append(req)
+                            continue
+
+                        # Retrieve embedding from shared memory
+                        speech_data = self.shared_speech_manager.get_index_speech(speech_index)
+                        if speech_data is None:
+                            logger.error(f"SFT mode: speech_index {speech_index} data not ready")
+                            req.router_aborted = True
+                            self.shm_req_manager.put_back_req_obj(req)
+                            req.can_released_mark = True
+                            continue
+
+                        speech_token, speech_feat, embedding = speech_data
+                        logger.info(f"SFT mode: req_id {req.request_id}, spk_id={spk_id}, embedding shape={embedding.shape if embedding is not None else 'None'}")
+
+                        # Set speech_token with vocab offset (same as zero-shot mode)
+                        if not req.bistream:
+                            if speech_token.size > 0:
+                                # Add vocab_size + 2 offset for correct embedding lookup
+                                speech_token_offset = (speech_token + self.vocab_size + 2)
+                                audio_ids = speech_token_offset.flatten().tolist()
+                            else:
+                                audio_ids = []
+                            with self.shm_req_manager.get_req_lock_by_index(req.index_in_shm_mem):
+                                req.set_speech_token(audio_ids)
+
+                        req.prompt_token_pad = int(np.ceil(speech_token.size / self.token_hop_len) * self.token_hop_len - speech_token.size) if speech_token.size > 0 else 0
+                        logger.info(f"Send: {module_name:<14} | req_id {req.request_id} | semantic_len={req.semantic_len} | text_len={req.text_len} | mode=SFT to tts_llm")
+
+                        # Send to LLM
+                        self.shm_req_manager.put_back_req_obj(req)
+                        self.send_to_tts_llms[tts_model_name].send_pyobj(req.index_in_shm_mem)
+                        cost_time = (time.time() - req.start_time) * 1000
+                        logger.info(f"module {module_name} req_id {req.request_id} cost_time {cost_time} ms")
+                        continue
 
                     if need_extract_speech:
                         logger.debug(f"tts_encode req_id {req.request_id} generate speech index {speech_index} cache")

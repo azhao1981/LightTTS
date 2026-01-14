@@ -1,6 +1,6 @@
 test/*.json
 test/*.md
-pretrained_models/
+pretrained_models
 __pycache__/
 .pyc
 build
@@ -12,3 +12,8 @@ test/outs
 .claude
 .env
 .envrc
+logs
+*.wav
+outs
+temp
+tmp

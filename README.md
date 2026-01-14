@@ -150,3 +150,12 @@ When your service is started, you can call the service through the http API. We 
 
 ## License
 This repository is released under the [Apache-2.0](LICENSE) license.
+
+
+## claude lsp
+
+```bash
+export ENABLE_LSP_TOOLS=1
+uv pip install pyright
+你可以使用 pyright-lsp 更好的查找代码
+```

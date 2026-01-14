@@ -196,6 +196,10 @@ class Req(ctypes.Structure):
 
         self.speech_index = request_dict.get("speech_index", -1)
         self.need_extract_speech = request_dict.get("need_extract_speech", False)
+
+        # Store spk_id as Python attribute (not modifying ctypes structure)
+        object.__setattr__(self, 'spk_id', request_dict.get('spk_id', ''))
+
         self.token_offset = 0
         self.ignore_eos = True
 
