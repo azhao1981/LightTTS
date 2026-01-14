@@ -198,7 +198,14 @@ class HttpServerManager:
             request_headers = request.headers if request is not None else {}
             await self._log_req_header(request_headers, request_id)
 
-            prompt_text_ids = await self._async_encode(request_dict["prompt_text"])
+            # Use pre-computed prompt_text_ids if available (for SFT/cached zero-shot mode)
+            # Otherwise encode prompt_text string
+            prompt_text_ids = request_dict.get("prompt_text_ids")
+            if prompt_text_ids is not None:
+                logger.info(f"req_id {request_id}: using pre-computed prompt_text_ids, len={len(prompt_text_ids)}")
+            else:
+                prompt_text_ids = await self._async_encode(request_dict["prompt_text"])
+
             text_ids = await self._async_encode(request_dict["text"])
             if not bistream:
                 prompt_ids = list(chain([self.sos_eos], prompt_text_ids, text_ids, [self.task_id]))

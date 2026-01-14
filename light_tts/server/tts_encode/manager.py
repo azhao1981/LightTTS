@@ -128,14 +128,19 @@ class TTS1EncodeManager:
                         speech_token, speech_feat, embedding = speech_data
                         logger.info(f"SFT mode: req_id {req.request_id}, spk_id={spk_id}, embedding shape={embedding.shape if embedding is not None else 'None'}")
 
-                        # Set speech_token (empty array in SFT mode)
+                        # Set speech_token with vocab offset (same as zero-shot mode)
                         if not req.bistream:
-                            audio_ids = speech_token.flatten().tolist() if speech_token.size > 0 else []
+                            if speech_token.size > 0:
+                                # Add vocab_size + 2 offset for correct embedding lookup
+                                speech_token_offset = (speech_token + self.vocab_size + 2)
+                                audio_ids = speech_token_offset.flatten().tolist()
+                            else:
+                                audio_ids = []
                             with self.shm_req_manager.get_req_lock_by_index(req.index_in_shm_mem):
                                 req.set_speech_token(audio_ids)
 
-                        req.prompt_token_pad = 0
-                        logger.info(f"Send: {module_name:<14} | req_id {req.request_id} | semantic_len=0 | text_len={req.text_len} | mode=SFT to tts_llm")
+                        req.prompt_token_pad = int(np.ceil(speech_token.size / self.token_hop_len) * self.token_hop_len - speech_token.size) if speech_token.size > 0 else 0
+                        logger.info(f"Send: {module_name:<14} | req_id {req.request_id} | semantic_len={req.semantic_len} | text_len={req.text_len} | mode=SFT to tts_llm")
 
                         # Send to LLM
                         self.shm_req_manager.put_back_req_obj(req)

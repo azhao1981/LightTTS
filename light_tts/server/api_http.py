@@ -279,6 +279,9 @@ async def inference_zero_shot(
     is_sft = spk_id.endswith('_sft') if spk_id else False
     logger.info(f"[API] spk_id={spk_id}, is_sft={is_sft}")
 
+    # Initialize prompt_text_ids (used for SFT mode with cached zero-shot data)
+    prompt_text_ids = None
+
     # Check spk_id parameter
     if spk_id:
         if is_sft:
@@ -322,6 +325,17 @@ async def inference_zero_shot(
                 speech_token = spk_info.get('llm_prompt_speech_token', torch.tensor([])).cpu().numpy()
                 speech_feat = spk_info.get('prompt_speech_feat', torch.tensor([])).cpu().numpy()
 
+                # Extract prompt_text token IDs from spk2info (for cached zero-shot format)
+                # This is critical for proper LLM input structure
+                prompt_text_tensor = spk_info.get('prompt_text', torch.tensor([]))
+                if prompt_text_tensor.numel() > 0:
+                    # prompt_text is stored as token IDs, convert to list
+                    prompt_text_ids = prompt_text_tensor.flatten().tolist()
+                    logger.info(f"SFT mode: extracted prompt_text_ids from spk2info, len={len(prompt_text_ids)}")
+                else:
+                    prompt_text_ids = []
+                    logger.info(f"SFT mode: no prompt_text in spk2info, using empty")
+
                 # Handle speech_feat shape (squeeze if needed)
                 if len(speech_feat.shape) == 3 and speech_feat.shape[0] == 1:
                     speech_feat = speech_feat.squeeze(0)
@@ -345,9 +359,9 @@ async def inference_zero_shot(
             else:
                 logger.info(f"SFT mode: using cached shared memory for spk_id={spk_id}, speech_index={speech_index}")
 
-            semantic_len = 0
+            semantic_len = 0  # Will be set by encode process based on speech_token length
             need_extract_speech = False
-            prompt_text = ''
+            prompt_text = ''  # Not used when prompt_text_ids is provided
             prompt_speech_16k = None
             speech_md5 = None
         else:
@@ -405,6 +419,7 @@ async def inference_zero_shot(
             "text": text,
             "spk_id": spk_id,  # 新增字段
             "prompt_text": prompt_text,
+            "prompt_text_ids": prompt_text_ids,  # Pre-computed token IDs for SFT mode
             "tts_model_name": tts_model_name,
             "speech_md5": speech_md5,
             "need_extract_speech": need_extract_speech,
